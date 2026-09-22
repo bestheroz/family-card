@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """family-wiki 의 data/ 카드 JSON 을 읽고 스키마를 검증한다 (build_site.py 가 쓴다).
 
-데이터는 family-wiki(private) 의 다섯 종류다.
+데이터는 family-wiki(private) 의 일곱 종류다.
 
     data/profiles/*.json   가족 카드            docs/PROFILE_SCHEMA.md
     data/projects/*.json   계획 카드            docs/PROJECT_SCHEMA.md
     data/schedule.json     가족 일정 (한 파일)   docs/SCHEDULE_SCHEMA.md
     data/changelog.json    최근 변경 (한 파일)   docs/CHANGELOG_SCHEMA.md
     data/daily.json        하루 요약 (한 파일)   docs/DAILY_SCHEMA.md
+    data/timeline.json     일대기   (한 파일)   docs/TIMELINE_SCHEMA.md
+    data/travels.json      여행 지도 (한 파일)   docs/TRAVELS_SCHEMA.md
 
 위키 본문(wiki/·raw/)은 읽지 않는다 — 카드는 사람이 공개 범위를 골라 다시 쓴 요약이다.
 공개 범위는 그 저장소의 docs/PRIVACY.md.
@@ -23,7 +25,8 @@
 - 표준 라이브러리만 사용한다.
 - 카드 한 건이 스키마에 어긋나면 **그 파일만 건너뛰고** 사유를 남긴다. 한 파일의 실수로
   전체 카드가 사라지지 않게. 일정·변경·요약은 파일이 하나라 그 섹션만 빠진다.
-- `schedule.json`·`changelog.json`·`daily.json` 은 **없어도 정상**이다 (경고 없이 그 섹션만 비운다).
+- `schedule.json`·`changelog.json`·`daily.json`·`timeline.json`·`travels.json` 은 **없어도 정상**이다
+  (경고 없이 그 섹션만 비운다).
 - 일정 창은 **달력일**이다 (`day_window`·`events_in_window`). 가족 일정은 주말이 본체라
   업무일 창을 쓰지 않는다. 사이트는 오늘부터 달력일 3일(`SITE_SCHEDULE_DAYS`, 오늘·내일·모레)을
   그리고, 빌드 시각 기준 **지난 항목은 취소선**(`event_done`)을 긋는다.
@@ -123,7 +126,7 @@ class GitHub:
 
 
 SCHEMA_VERSION = 1
-DEFAULT_GROUP = "김동준네"
+DEFAULT_GROUP = "행복이 가득한 주니요미로하네"
 BANNER = "MBTI·나이대는 추측이다. 말투 뱃지는 관측값이다. 관찰된 성향과 재미 코너를 섞어 읽지 않는다."
 
 # ── 검증 규칙 (family-wiki/docs/PROFILE_SCHEMA.md · PROJECT_SCHEMA.md · PRIVACY.md) ───────────────
@@ -225,7 +228,18 @@ EVENT_KINDS = ("가족", "개인", "회사", "기념일", "여행", "병원", "�
 # 값은 `가족일정` · `회사일정` · `gcal:<캘린더별칭>` 셋이다. 렌더에 쓰지 않으므로 목록을 강제하지는 않는다 —
 # 여기서 막으면 위키 쪽이 별칭을 하나 늘릴 때 일정 섹션이 통째로 사라진다.
 WIKI_SOURCE = "가족일정"
-CHANGE_CARDS = ("profile", "project", "schedule", "site")
+CHANGE_CARDS = ("profile", "project", "schedule", "timeline", "travel", "site")
+
+# 일대기 (docs/TIMELINE_SCHEMA.md) — 가족사에 남을 사건만 고른 한 줄들이다.
+# kind 여덟 값은 family-wiki 의 build_timeline.py 와 같은 목록이어야 한다.
+# 새 값을 넣으면 build_site.TIMELINE_KIND_CLASS 에 색 클래스도 같이 넣는다 (테스트가 둘을 대조한다).
+TIMELINE_KINDS = ("가족", "여행", "집", "건강", "로하", "회사", "기념일", "기타")
+SITE_TIMELINE_ITEMS = 12  # 목록 페이지에 그리는 최근 건수 — 전체는 t/timeline.html
+
+# 여행 (docs/TRAVELS_SCHEMA.md) — 좌표는 도시 수준 근사값이다.
+TRAVEL_KINDS = ("해외", "국내")
+TRAVEL_MAX_HIGHLIGHTS = 5
+TRAVEL_HIGHLIGHT_CHARS = 40
 DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}$")  # 날짜 비교를 문자열로 하므로 형식이 어긋나면 받지 않는다
 SITE_SCHEDULE_DAYS = 3  # 일정 카드 창: 오늘·내일·모레 (달력일, 주말 포함)
 CHANGELOG_KEEP_DAYS = 7
@@ -314,7 +328,7 @@ def _group_errors(data: dict[str, Any]) -> list[str]:
 
 
 def _meta_errors(data: dict[str, Any]) -> list[str]:
-    """다섯 카드가 모두 함께 타는 머리 검사 — `schema_version` 과 `group`."""
+    """모든 카드가 함께 타는 머리 검사 — `schema_version` 과 `group`."""
     return _version_errors(data) + _group_errors(data)
 
 
@@ -528,6 +542,128 @@ def validate_changelog(data: object) -> list[str]:
             errors.append(f"{where}.card: {' | '.join(CHANGE_CARDS)} 중 하나여야 합니다 (현재 {cardk!r})")
         if not text(e.get("summary")):
             errors.append(f"{where}.summary: 비어 있습니다 (무엇이 바뀌었는지 한 줄)")
+    return errors + _privacy_errors(data)
+
+
+def validate_timeline(data: object) -> list[str]:
+    """거부 사유 목록. 빈 리스트면 통과 (docs/TIMELINE_SCHEMA.md '검증').
+
+    파일이 하나라 어긋나면 일대기 섹션만 빠지고 나머지 카드는 그대로 나온다.
+    `note`(비고)는 일정 카드와 같은 규칙이다 — 병원명·금액·괄호는 위키 비고 칸에 두고 카드에는 싣지 않는다.
+    `members` 는 타입만 본다. 명단(`family: true`)에 있는 호칭인지는 위키 쪽이 표를 보고 가린다 —
+    카드 저장소에는 명단이 없다 (public 이라 코드에 호칭을 두지 않는다).
+    """
+    if not isinstance(data, dict):
+        return [f"최상위가 객체가 아닙니다 (현재 {type(data).__name__})"]
+    errors = _meta_errors(data)
+    entries = data.get("entries")
+    if entries is None:
+        entries = []
+    if not isinstance(entries, list):
+        errors.append("entries: 배열이어야 합니다")
+        entries = []
+    for i, e in enumerate(entries):
+        where = f"entries[{i}]"
+        if not isinstance(e, dict):
+            errors.append(f"{where}: 객체가 아닙니다")
+            continue
+        errors.extend(_date_errors(e.get("date"), f"{where}.date"))
+        errors.extend(_date_errors(e.get("end"), f"{where}.end", required=False))
+        start, end = text(e.get("date")), text(e.get("end"))
+        if end and DATE_RX.match(start) and DATE_RX.match(end) and end < start:
+            errors.append(f"{where}.end: date 이상이어야 합니다 ({start} → {end})")
+        kind = text(e.get("kind"))
+        if kind not in TIMELINE_KINDS:
+            errors.append(f"{where}.kind: {' | '.join(TIMELINE_KINDS)} 중 하나여야 합니다 (현재 {kind!r})")
+        if not text(e.get("title")):
+            errors.append(f"{where}.title: 비어 있습니다 (카드에 찍을 한 줄)")
+        if text(e.get("note")):
+            errors.append(f"{where}.note: 비고는 카드에 싣지 않습니다 — 비워야 합니다 (docs/TIMELINE_SCHEMA.md)")
+        mem = e.get("members")
+        if mem is not None and not isinstance(mem, list):
+            errors.append(f"{where}.members: 호칭 배열이어야 합니다")
+    return errors + _privacy_errors(data)
+
+
+def _stop_errors(s: object, where: str) -> list[str]:
+    """경유지 한 곳 — 이름과 좌표. 좌표는 도시 수준 근사값이면 된다 (docs/TRAVELS_SCHEMA.md)."""
+    if not isinstance(s, dict):
+        return [f"{where}: 객체가 아닙니다"]
+    errors: list[str] = []
+    if not text(s.get("name")):
+        errors.append(f"{where}.name: 비어 있습니다 (지도 핀에 붙일 지명)")
+    for key, limit in (("lat", 90.0), ("lon", 180.0)):
+        v = s.get(key)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            errors.append(f"{where}.{key}: 숫자여야 합니다 (현재 {v!r})")
+        elif not -limit <= float(v) <= limit:
+            errors.append(f"{where}.{key}: -{limit:g} ~ {limit:g} 범위여야 합니다 (현재 {v!r})")
+    return errors
+
+
+def validate_travels(data: object) -> list[str]:
+    """거부 사유 목록. 빈 리스트면 통과 (docs/TRAVELS_SCHEMA.md '검증').
+
+    `highlights` 의 링크·금액·숙소명·예약번호 중 링크류는 `_privacy_errors` 가 막는다. 금액·숙소명은
+    기계가 가릴 수 없어 위키 쪽 규칙이다 — 여기서는 개수와 길이만 본다.
+    """
+    if not isinstance(data, dict):
+        return [f"최상위가 객체가 아닙니다 (현재 {type(data).__name__})"]
+    errors = _meta_errors(data)
+    trips = data.get("trips")
+    if trips is None:
+        trips = []
+    if not isinstance(trips, list):
+        errors.append("trips: 배열이어야 합니다")
+        trips = []
+    seen: set[str] = set()
+    for i, t in enumerate(trips):
+        where = f"trips[{i}]"
+        if not isinstance(t, dict):
+            errors.append(f"{where}: 객체가 아닙니다")
+            continue
+        tid = text(t.get("id"))
+        if not tid:
+            errors.append(f"{where}.id: 비어 있습니다 (YYYY-MM-지역, 파일 안에서 유일)")
+        elif tid in seen:
+            errors.append(f"{where}.id: 같은 id 가 두 번 있습니다")  # 값은 적지 않는다 — 지명이 들어 있다
+        else:
+            seen.add(tid)
+        if not text(t.get("title")):
+            errors.append(f"{where}.title: 비어 있습니다 (카드에 찍을 여행지 이름)")
+        errors.extend(_date_errors(t.get("start"), f"{where}.start"))
+        errors.extend(_date_errors(t.get("end"), f"{where}.end"))
+        start, end = text(t.get("start")), text(t.get("end"))
+        if DATE_RX.match(start) and DATE_RX.match(end) and end < start:
+            errors.append(f"{where}.end: start 이상이어야 합니다 ({start} → {end})")
+        kind = text(t.get("kind"))
+        if kind not in TRAVEL_KINDS:
+            errors.append(f"{where}.kind: {' | '.join(TRAVEL_KINDS)} 중 하나여야 합니다 (현재 {kind!r})")
+        stops = t.get("stops")
+        if not isinstance(stops, list) or not stops:
+            errors.append(f"{where}.stops: 한 곳 이상이어야 합니다 ({{\"name\":…, \"lat\":…, \"lon\":…}})")
+        else:
+            for j, s in enumerate(stops):
+                errors.extend(_stop_errors(s, f"{where}.stops[{j}]"))
+        hl = t.get("highlights")
+        if hl is None:
+            hl = []
+        if not isinstance(hl, list):
+            errors.append(f"{where}.highlights: 배열이어야 합니다")
+        else:
+            if len(hl) > TRAVEL_MAX_HIGHLIGHTS:
+                errors.append(f"{where}.highlights: {TRAVEL_MAX_HIGHLIGHTS}개 이하여야 합니다 (현재 {len(hl)})")
+            for j, h in enumerate(hl):
+                if not isinstance(h, str) or not h.strip():
+                    errors.append(f"{where}.highlights[{j}]: 비어 있지 않은 문자열이어야 합니다")
+                elif len(h.strip()) > TRAVEL_HIGHLIGHT_CHARS:
+                    # 사유에 원문을 넣지 않는다 — 길이만 적는다 (일정·프로필 카드와 같은 규칙)
+                    errors.append(
+                        f"{where}.highlights[{j}]: {TRAVEL_HIGHLIGHT_CHARS}자 이내여야 합니다 (현재 {len(h.strip())}자)"
+                    )
+        mem = t.get("members")
+        if mem is not None and not isinstance(mem, list):
+            errors.append(f"{where}.members: 호칭 배열이어야 합니다")
     return errors + _privacy_errors(data)
 
 
@@ -765,6 +901,51 @@ def entries_within(changelog: object, today: date, days: int | None = None) -> l
     return items
 
 
+def timeline_entries(timeline: object) -> list[dict[str, Any]]:
+    """일대기 항목을 `date` 오름차순으로. 날짜로 읽히지 않는 줄은 빠진다.
+
+    같은 날 여러 건은 파일에 적힌 순서를 지킨다 (파이썬 정렬이 안정적이다) — 위키 표의 순서가 곧 그날의 순서다.
+    """
+    d = timeline if isinstance(timeline, dict) else {}
+    out = [
+        e
+        for e in (d.get("entries") or [])
+        if isinstance(e, dict) and DATE_RX.match(text(e.get("date"))) and _valid_date(text(e.get("date")))
+    ]
+    out.sort(key=lambda e: text(e.get("date")))
+    return out
+
+
+def travel_trips(travels: object) -> list[dict[str, Any]]:
+    """여행을 `start` 오름차순으로. 날짜로 읽히지 않는 여행은 빠진다 (핀 번호가 곧 이 순서다)."""
+    d = travels if isinstance(travels, dict) else {}
+    out = [
+        t
+        for t in (d.get("trips") or [])
+        if isinstance(t, dict) and DATE_RX.match(text(t.get("start"))) and _valid_date(text(t.get("start")))
+    ]
+    out.sort(key=lambda t: text(t.get("start")))
+    return out
+
+
+def trip_stops(trip: object) -> list[dict[str, Any]]:
+    """좌표가 숫자이고 범위 안인 경유지만. 검증을 우회한 값이 지도 밖으로 나가지 않게 한 번 더 건다."""
+    t = trip if isinstance(trip, dict) else {}
+    out = []
+    for s in t.get("stops") or []:
+        if not isinstance(s, dict):
+            continue
+        lat, lon = s.get("lat"), s.get("lon")
+        if not isinstance(lat, (int, float)) or isinstance(lat, bool):
+            continue
+        if not isinstance(lon, (int, float)) or isinstance(lon, bool):
+            continue
+        if not (-90 <= float(lat) <= 90 and -180 <= float(lon) <= 180):
+            continue
+        out.append(s)
+    return out
+
+
 def project_progress(milestones: object) -> tuple[int, int, str]:
     """(완료 수, 전체 수, 다음 마일스톤). 진행 중인 것이 있으면 그것이 '다음'이다."""
     raw = milestones if isinstance(milestones, list) else []
@@ -793,12 +974,18 @@ def badge_short(badge: object) -> str:
 
 # 디렉터리 하나에 카드 여러 장 / 파일 하나가 카드 한 장
 CARD_DIRS = (("profile", "profiles"), ("project", "projects"))
-CARD_FILES = (("schedule", "schedule.json"), ("changelog", "changelog.json"), ("daily", "daily.json"))
+CARD_FILES = (
+    ("schedule", "schedule.json"),
+    ("changelog", "changelog.json"),
+    ("daily", "daily.json"),
+    ("timeline", "timeline.json"),
+    ("travel", "travels.json"),
+)
 
 
 @dataclass
 class Card:
-    kind: str  # "profile" | "project" | "schedule" | "changelog" | "daily"
+    kind: str  # "profile" | "project" | "schedule" | "changelog" | "daily" | "timeline" | "travel"
     file: str  # 표시용 경로 (profiles/아빠.json · schedule.json)
     data: dict[str, Any] | None
     errors: list[str] = field(default_factory=list)
@@ -822,6 +1009,10 @@ def _parse(kind: str, shown: str, raw: str) -> Card:
         errors = validate_schedule(data)
     elif kind == "daily":
         errors = validate_daily(data)
+    elif kind == "timeline":
+        errors = validate_timeline(data)
+    elif kind == "travel":
+        errors = validate_travels(data)
     else:
         errors = validate_changelog(data)
     return Card(kind, shown, data if isinstance(data, dict) else None, errors)

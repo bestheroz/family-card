@@ -11,8 +11,11 @@
 카드 JSON 화이트리스트만 빌드한다 (family-wiki/docs/PRIVACY.md). 검색 엔진 색인은 noindex 로 막는다.
 이모지 반응 집계는 스키마에 있어도 싣지 않는다.
 
-목록 페이지의 섹션 순서는 **하루 요약 → 가족 일정 → 계획 → 가족 → 최근 변경** 이다.
-어제·오늘 있었던 일이 맨 위, 곧 있을 일이 그 다음, 잘 안 바뀌는 카드가 아래로 간다.
+목록 페이지의 섹션 순서는 **하루 요약 → 가족 일정 → 일대기 → 여행 지도 → 계획 → 가족 → 최근 변경** 이다.
+어제·오늘 있었던 일이 맨 위, 곧 있을 일이 그 다음, 지나온 일과 잘 안 바뀌는 카드가 아래로 간다.
+
+일대기·여행은 전체를 담은 한 장이 `t/timeline.html`·`t/travels.html` 에 따로 나간다.
+여행 지도는 **인라인 SVG** 다 — 윤곽선은 `map_data.py`(생성물)에서 읽고 타일·CDN·JS 를 쓰지 않는다.
 
 일정 창은 **달력일**이다 (오늘·내일·모레). 주말을 건너뛰지 않고, 공휴일은 날짜 머리에 표식만 붙인다.
 
@@ -25,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import math
 import os
 import re
 import sys
@@ -44,6 +48,8 @@ from cards_data import (  # noqa: E402
     KST,
     MILESTONE_STATES,
     PROJECT_STATUS_ORDER,
+    SITE_TIMELINE_ITEMS,
+    TIMELINE_KINDS,
     Card,
     GitHub,
     badge_short,
@@ -61,7 +67,18 @@ from cards_data import (  # noqa: E402
     str_list,
     sub,
     text,
+    timeline_entries,
+    travel_trips,
+    trip_stops,
     warn,
+)
+from map_data import (  # noqa: E402  (생성물 — scripts/make_map_data.py 가 만든다)
+    KOREA_PATH,
+    KOREA_VIEWBOX,
+    WORLD_PATH,
+    WORLD_VIEWBOX,
+    project_korea,
+    project_world,
 )
 
 PROJECT_STATUS_CLASS = {"준비": "ps-todo", "진행중": "ps-doing", "보류": "ps-hold", "완료": "ps-done"}
@@ -74,7 +91,7 @@ WORK_STATE_HINTS = (
     ("보류", "ws-hold"),
     ("미착수", "ws-todo"),
 )
-PROJECT_BANNER = "계획 페이지는 위키 요약이다. 일정·범위는 데이터 기준일 시점의 상태이며 확정이 아니다."
+PROJECT_BANNER = "계획 카드는 위키에 적어 둔 것의 요약이다. 날짜와 범위는 그때의 생각이고 확정이 아니다."
 SIGNAL_ROWS = (
     ("utterances", "발화 수", "건"),
     ("total_chars", "총 글자 수", "자"),
@@ -88,9 +105,16 @@ SIGNAL_ROWS = (
 CHAT_GAP_RATIO = 2.0
 
 WEEKDAY_KO = ("월", "화", "수", "목", "금", "토", "일")
-CHANGE_CARD_KO = {"profile": "가족", "project": "계획", "schedule": "일정", "site": "사이트"}
-CHANGE_CARD_CLASS = {"profile": "ck-profile", "project": "ck-project", "schedule": "ck-sched", "site": "ck-site"}
-# 일정 종류 아홉 값 (cards_data.EVENT_KINDS). 색은 따뜻한 가족 팔레트 안에서만 고른다.
+# 변경 목록 칩 (cards_data.CHANGE_CARDS 와 같은 키여야 한다 — 테스트가 둘을 대조한다)
+CHANGE_CARD_KO = {
+    "profile": "가족", "project": "계획", "schedule": "일정",
+    "timeline": "일대기", "travel": "여행", "site": "사이트",
+}
+CHANGE_CARD_CLASS = {
+    "profile": "ck-profile", "project": "ck-project", "schedule": "ck-sched",
+    "timeline": "ck-timeline", "travel": "ck-travel", "site": "ck-site",
+}
+# 일정 종류 아홉 값 (cards_data.EVENT_KINDS). 색은 하늘·민트 파스텔 팔레트 안에서만 고른다.
 EVENT_KIND_CLASS = {
     "가족": "ek-family",
     "개인": "ek-self",
@@ -111,10 +135,38 @@ CARD_KIND_KO = {
     "schedule": "일정 카드",
     "changelog": "변경 카드",
     "daily": "요약 카드",
+    "timeline": "일대기 카드",
+    "travel": "여행 카드",
+}
+# 일대기 구분 여덟 값 (cards_data.TIMELINE_KINDS). 색은 하늘·민트 파스텔 팔레트 안에서만 고른다 —
+# 새 hex 를 늘리지 않는다 (테스트가 kind 목록과 이 표를 대조하고, 글자/면 대비를 숫자로 잰다).
+TIMELINE_KIND_CLASS = {
+    "가족": "tk-family",
+    "여행": "tk-trip",
+    "집": "tk-home",
+    "건강": "tk-health",
+    "로하": "tk-kid",
+    "회사": "tk-work",
+    "기념일": "tk-anniv",
+    "기타": "tk-etc",
 }
 CHANGES_EMPTY = f"최근 {CHANGELOG_KEEP_DAYS}일간 바뀐 카드가 없다"
 SCHEDULE_EMPTY = f"오늘부터 {SITE_SCHEDULE_DAYS}일 안에 잡힌 일정이 없다"
 DAILY_EMPTY = "요약이 아직 없다 — 카톡을 정리하면 채워진다"
+TIMELINE_EMPTY = "아직 적어 둔 일대기가 없다"
+TRAVEL_EMPTY = "아직 기록한 여행이 없다"
+
+# 지도 핀 — 크기는 viewBox 폭에 맞춰 잡는다 (세계는 360도, 한국 인셋은 6도 남짓이라 같은 수치를 쓸 수 없다).
+PIN_R_RATIO = 1 / 100  # 핀 반지름 = viewBox 폭 × 이 비율
+PIN_FONT_RATIO = 1 / 70
+# 핀을 벌리는 기준은 **거의 완전히 겹칠 때**만이다 (반지름의 0.55배 안). 세계 지도에서는 핀 하나가
+# 수백 km 를 덮으므로 이웃 도시까지 벌리면 핀이 딴 나라에 찍힌다 — 같은 여행의 경유지는 번호도 같고
+# 점선으로 이어져 있어 조금 겹쳐도 읽힌다. 벌릴 때는 반지름의 1.3배까지만 밀어 둘로 보이게 한다.
+PIN_OVERLAP = 0.55
+PIN_SPREAD = 1.3
+# 한국 인셋은 세계 지도보다 좁게 그려진다 — 같은 비율로 찍으면 핀과 번호가 몇 px 로 줄어 읽히지 않는다.
+# 그려지는 폭의 비(세계 ≒ 2배 남짓)만큼 키운다.
+KOREA_PIN_SCALE = 2.6
 
 
 # ───────────────────────────────────────────────────────────────────────── 유틸
@@ -146,38 +198,48 @@ def g(d: object, path: str, default: Any = None) -> Any:
 
 # ───────────────────────────────────────────────────────────────────────── 스타일
 #
-# 따뜻한 가족 팔레트. 테라코타(대표색) · 세이지(재미 코너) · 크림(바탕).
+# 밝은 파스텔 팔레트. 하늘색(대표색) · 민트(재미 코너) · 아주 연한 하늘빛 바탕에 흰 카드.
 # 회사 CI 색을 쓰지 않는다 — 여기는 가족 위키다.
-# `--brand-ink`·`--fun`·`--muted` 는 글자용이라 라이트 바탕에서 대비 4.5:1 이상으로 골랐다.
-# 큰 면·선에만 `--brand` 를 쓰고 작은 글자에는 절대 쓰지 않는다 (라이트에서 대비가 모자란다).
+#
+# 토큰은 **면용**과 **글자용**으로 갈라 둔다. 파스텔 원색(`--brand`·`--brand70`·`--brand50`·
+# `--fun70`·`--fun50`)은 면·막대·칩·아바타에만 쓰고 글자에는 절대 쓰지 않는다 — 흰 바탕에서 대비가
+# 2:1 대로 떨어진다. 글자용은 `--ink`·`--ink2`·`--muted`·`--brand-ink`·`--fun`·`--ok`·`--warn` 이고
+# 라이트에서 흰 바탕·연한 면 대비 **4.5:1 이상**으로 골랐다 (테스트가 숫자로 지킨다).
+# 파스텔 면 위에 얹는 글자는 `--on-brand`·`--on-warn` 이다 — 하늘·민트 칩에 흰 글자를 올리지 않는다.
 
 CSS = """
 :root{
-  --bg:#FAF6F1; --card:#FFFFFF; --ink:#2A211C; --ink2:#57493F; --muted:#7B6A5C;
-  --line:#E9DFD4; --line2:#F3EBE2; --soft:#F7F1EA;
-  --brand:#C05B3E; --brand70:#D18A72; --brand50:#E2B5A4; --brand-soft:#FBEDE7; --brand-ink:#9A4227;
-  --brand-line:#EFCFBF;
-  --fun:#546E50; --fun-soft:#EAF0E7; --fun-line:#CFDDC9; --fun-bg:#F6F9F4;
-  --ok:#2F7A55; --ok-soft:#E4F2E9;
-  --warn:#B03A2E; --warn-soft:#FBEAE7; --warn-line:#EEBFB6;
-  --hero-bg:#FFFFFF; --hero-ink:#2A211C; --hero-sub:#57493F;
-  --tri-blend:multiply; --tri-opacity:.9;
-  --shadow:0 1px 2px rgba(42,33,28,.04),0 8px 24px -18px rgba(42,33,28,.2);
-  --focus:0 0 0 3px rgba(192,91,62,.35);
+  --bg:#F2F9FD; --card:#FFFFFF; --ink:#14252E; --ink2:#3F5763; --muted:#59717E;
+  --line:#D6E8F2; --line2:#EDF6FA; --soft:#F4FAFD;
+  --brand:#5FB4E6; --brand70:#8FCBEF; --brand50:#BBE2F7; --brand-soft:#E4F4FC; --brand-ink:#14607F;
+  --brand-line:#BEDFF0;
+  --fun:#176F5F; --fun70:#7FD3BE; --fun50:#B7E8DC; --fun-soft:#DDF4EE; --fun-line:#A9E0D3; --fun-bg:#EFFAF7;
+  --ok:#17754F; --ok-soft:#DEF3E7;
+  --warn:#B0424F; --warn-soft:#FDECEF; --warn-line:#F3C9D0;
+  --on-brand:#0E3242; --on-warn:#FFFFFF;
+  /* 지도 — 면(땅)·선(윤곽)·바다. 파스텔 팔레트의 값을 그대로 쓰지만 라이트/다크에서 역할이 뒤집히므로
+     토큰을 따로 둔다 (땅은 밝은 하늘, 윤곽선은 반대 밝기). 테스트가 선/면 대비를 숫자로 잰다. */
+  --map-sea:#F4FAFD; --map-land:#BBE2F7; --map-line:#0E3242;
+  --hero-bg:#FFFFFF; --hero-ink:#14252E; --hero-sub:#3F5763;
+  --tri-blend:multiply; --tri-opacity:.85;
+  --shadow:0 1px 2px rgba(20,60,85,.05),0 10px 26px -20px rgba(20,60,85,.28);
+  --focus:0 0 0 3px rgba(95,180,230,.45);
 }
 @media (prefers-color-scheme:dark){
   :root{
-    --bg:#17130F; --card:#201A16; --ink:#F2EAE2; --ink2:#D3C5B8; --muted:#A4937F;
-    --line:#332A23; --line2:#29221C; --soft:#261F19;
-    --brand:#E07A56; --brand70:#D18A72; --brand50:#E2B5A4; --brand-soft:#3A2218; --brand-ink:#F0A183;
-    --brand-line:#5A3628;
-    --fun:#A8C39E; --fun-soft:#23301F; --fun-line:#3A4C34; --fun-bg:#1C241A;
-    --ok:#74CFA0; --ok-soft:#14291E;
-    --warn:#F09184; --warn-soft:#38201C; --warn-line:#63352D;
-    --hero-bg:#1B1611; --hero-ink:#F5EEE7; --hero-sub:#C9BAAC;
-    --tri-blend:normal; --tri-opacity:.8;
+    --bg:#0E1B22; --card:#16242C; --ink:#E8F4F9; --ink2:#BBD2DC; --muted:#93ADB9;
+    --line:#26383F; --line2:#1D2C33; --soft:#1B2A31;
+    --brand:#6FC0EE; --brand70:#8ECFF2; --brand50:#B2E1F7; --brand-soft:#16323F; --brand-ink:#8FD2F5;
+    --brand-line:#2C5568;
+    --fun:#84DCC6; --fun70:#7FD3BE; --fun50:#B7E8DC; --fun-soft:#123029; --fun-line:#2B5248; --fun-bg:#102621;
+    --ok:#74D3A4; --ok-soft:#10291F;
+    --warn:#F2A2AC; --warn-soft:#331C21; --warn-line:#5C3038;
+    --on-brand:#0A1C26; --on-warn:#0A1C26;
+    --map-sea:#1B2A31; --map-land:#2C5568; --map-line:#B2E1F7;
+    --hero-bg:#132129; --hero-ink:#EAF5FA; --hero-sub:#B4CCD7;
+    --tri-blend:normal; --tri-opacity:.7;
     --shadow:none;
-    --focus:0 0 0 3px rgba(224,122,86,.45);
+    --focus:0 0 0 3px rgba(111,192,238,.5);
   }
 }
 *,*::before,*::after{box-sizing:border-box}
@@ -197,7 +259,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;bac
 .num{font-variant-numeric:tabular-nums}
 .wrap{max-width:1080px;margin:0 auto;padding:0 20px 72px}
 
-/* 히어로 — 크림 바탕에 테라코타 3톤 원. 페이지에서 유일하게 큰 색면 */
+/* 히어로 — 흰 바탕에 하늘색 3톤 원. 페이지에서 유일하게 큰 색면 */
 .hero{position:relative;overflow:hidden;background:var(--hero-bg);color:var(--hero-ink);
   padding:44px 0 40px;border-bottom:1px solid var(--line)}
 .hero .in{position:relative;z-index:1;max-width:1080px;margin:0 auto;padding:0 20px;
@@ -209,7 +271,8 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;bac
 .tri::before{width:250px;height:250px;left:-150px;top:130px;background:var(--brand70)}
 .tri::after{width:190px;height:190px;left:-30px;top:290px;background:var(--brand50)}
 .hero-eyebrow{font-size:13.5px;color:var(--brand-ink);font-weight:700;margin-bottom:10px}
-.hero-title{font-size:clamp(30px,6vw,54px);font-weight:800;letter-spacing:-.04em;line-height:1.08}
+.hero-title{font-size:clamp(26px,4.6vw,42px);font-weight:800;letter-spacing:-.035em;line-height:1.16;
+  word-break:keep-all;text-wrap:balance;max-width:20ch}
 .hero-sub{font-size:15px;color:var(--hero-sub);margin-top:14px;max-width:560px;line-height:1.6}
 .hero-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}
 .hero-chips .chip{background:var(--soft);border:1px solid var(--line);border-radius:999px;
@@ -219,7 +282,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;bac
   text-decoration:none;margin-bottom:18px;font-weight:600}
 .back:hover{text-decoration:underline}
 
-/* 고정 안내줄 — 브랜드 톤으로 낮춰서 경고가 아니라 전제처럼 읽히게 */
+/* 고정 안내줄 — 하늘색 파스텔 면으로 낮춰서 경고가 아니라 전제처럼 읽히게 */
 .banner{position:sticky;top:0;z-index:20;background:var(--brand-soft);color:var(--brand-ink);
   border-bottom:1px solid var(--brand-line);padding:9px 20px;font-size:12.5px;font-weight:700;
   text-align:center;line-height:1.45}
@@ -314,10 +377,11 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;bac
 .mcard.low{border-style:dashed}
 .mhead{display:flex;align-items:center;gap:12px;min-width:0}
 .avatar{flex:0 0 auto;width:46px;height:46px;border-radius:14px;display:grid;place-items:center;
-  font-size:19px;font-weight:800;color:#fff;background:linear-gradient(135deg,var(--brand),var(--brand70));letter-spacing:-.02em}
-.avatar.av-1{background:linear-gradient(135deg,var(--fun),var(--fun-line));}
-.avatar.av-2{background:linear-gradient(135deg,var(--ok),var(--ok-soft));color:var(--ink)}
-.avatar.av-3{background:linear-gradient(135deg,var(--brand70),var(--brand50));color:var(--ink)}
+  font-size:19px;font-weight:800;color:var(--on-brand);
+  background:linear-gradient(135deg,var(--brand50),var(--brand70));letter-spacing:-.02em}
+.avatar.av-1{background:linear-gradient(135deg,var(--fun50),var(--fun70))}
+.avatar.av-2{background:linear-gradient(135deg,var(--brand70),var(--fun50))}
+.avatar.av-3{background:linear-gradient(135deg,var(--fun70),var(--brand50))}
 .mname{font-size:19px;font-weight:800;line-height:1.2;letter-spacing:-.03em}
 .mrole{font-size:12.5px;color:var(--muted);margin-top:4px;font-weight:600}
 .mnick{font-size:13.5px;color:var(--brand-ink);margin-top:10px;font-weight:700;line-height:1.45}
@@ -364,7 +428,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;bac
 .pcard .mchips{margin-top:12px}
 .mchip.proj{background:var(--brand-soft);border-color:var(--brand-soft);color:var(--brand-ink);font-weight:700}
 .ps{display:inline-block;font-size:11px;font-weight:800;padding:3px 10px;border-radius:999px;white-space:nowrap}
-.ps-doing{background:var(--brand);color:#fff}
+.ps-doing{background:var(--brand);color:var(--on-brand)}
 .ps-todo{background:var(--line2);color:var(--muted);border:1px solid var(--line)}
 .ps-hold{background:var(--warn-soft);color:var(--warn)}
 .ps-done{background:var(--ok-soft);color:var(--ok)}
@@ -383,7 +447,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;bac
   background:var(--card);border:2px solid var(--line)}
 .ms li.done::before{background:var(--brand);border-color:var(--brand)}
 .ms li.done::after{content:"";position:absolute;left:5px;top:7px;width:4px;height:7px;
-  border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
+  border:solid var(--on-brand);border-width:0 2px 2px 0;transform:rotate(45deg)}
 .ms li.doing::before{border-color:var(--brand);border-width:3px;background:var(--card);
   box-shadow:0 0 0 3px var(--brand-soft)}
 .ms li.doing{font-weight:800;color:var(--brand-ink)}
@@ -406,9 +470,9 @@ a.mem:hover{border-color:var(--brand70);color:var(--brand-ink)}
 .mem.noprofile{opacity:.7}
 .recent td.d{white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--muted);width:1%}
 
-/* 최근 변경 — 목록의 마지막 섹션. 브랜드 톤 카드로 (작은 글자는 --brand-ink) */
+/* 최근 변경 — 목록의 마지막 섹션. 하늘색 파스텔 카드로 (작은 글자는 --brand-ink) */
 .sec-changes{color:var(--ink);margin-top:28px}
-.sec-changes .sectag{background:var(--brand);color:#fff}
+.sec-changes .sectag{background:var(--brand);color:var(--on-brand)}
 .chcard{background:var(--brand-soft);border-color:var(--brand-line)}
 .chday+.chday{margin-top:14px;padding-top:14px;border-top:1px solid var(--brand-line)}
 .chdate{display:flex;align-items:baseline;gap:8px;font-size:12.5px;font-weight:800;color:var(--brand-ink);
@@ -419,8 +483,10 @@ a.mem:hover{border-color:var(--brand70);color:var(--brand-ink)}
 .ck{font-size:11px;font-weight:800;padding:2px 9px;border-radius:999px;white-space:nowrap;
   background:var(--card);border:1px solid var(--brand-line);color:var(--brand-ink)}
 .ck-profile{border-color:var(--fun-line);color:var(--fun)}
-.ck-project{background:var(--brand);border-color:var(--brand);color:#fff}
+.ck-project{background:var(--brand);border-color:var(--brand);color:var(--on-brand)}
 .ck-sched{border-style:dashed}
+.ck-timeline{border-color:var(--brand);color:var(--brand-ink)}
+.ck-travel{background:var(--fun-soft);border-color:var(--fun-line);color:var(--fun)}
 .ck-site{border-color:var(--line);color:var(--muted)}
 .chtarget{font-weight:800;color:var(--ink)}
 .chtarget a{color:var(--brand-ink);font-weight:800;text-decoration:none;border-bottom:1px solid var(--brand-line)}
@@ -428,14 +494,14 @@ a.mem:hover{border-color:var(--brand70);color:var(--brand-ink)}
 /* 신호 요약은 `발화 35→41건 · 평균 44→40자 · …` 로 길어진다 — 한글 낱말 안에서 끊지 않고
    조각 사이 공백에서만 접는다 (keep-all). anywhere 는 공백 없는 긴 토큰을 위한 안전판. */
 .chsum{color:var(--ink2);flex:1 1 240px;min-width:0;word-break:keep-all;overflow-wrap:anywhere}
-.today{font-size:10.5px;font-weight:800;padding:2px 8px;border-radius:999px;background:var(--brand);color:#fff;
-  letter-spacing:0}
+.today{font-size:10.5px;font-weight:800;padding:2px 8px;border-radius:999px;background:var(--brand);
+  color:var(--on-brand);letter-spacing:0}
 .hol{font-size:10.5px;font-weight:800;padding:2px 8px;border-radius:999px;background:var(--warn-soft);
   color:var(--warn);border:1px solid var(--warn-line);letter-spacing:0}
 
 /* 하루 요약 */
 .sec-daily{color:var(--ink);margin-top:36px}
-.sec-daily .sectag{background:var(--brand);color:#fff}
+.sec-daily .sectag{background:var(--brand);color:var(--on-brand)}
 .dday+.dday{margin-top:15px;padding-top:15px;border-top:1px solid var(--line2)}
 .ddate{display:flex;align-items:baseline;gap:8px;font-size:13px;font-weight:800;color:var(--ink);
   margin-bottom:9px;font-variant-numeric:tabular-nums}
@@ -471,11 +537,11 @@ a.mem:hover{border-color:var(--brand70);color:var(--brand-ink)}
 .ek-family{background:var(--brand-soft);border-color:var(--brand-line);color:var(--brand-ink)}
 .ek-self{background:var(--fun-soft);border-color:var(--fun-line);color:var(--fun)}
 .ek-work{background:var(--soft);border-color:var(--line);color:var(--ink2)}
-.ek-anniv{background:var(--brand);border-color:var(--brand);color:#fff}
+.ek-anniv{background:var(--brand);border-color:var(--brand);color:var(--on-brand)}
 .ek-trip{background:var(--ok-soft);border-color:var(--ok-soft);color:var(--ok)}
 .ek-hosp{background:var(--warn-soft);border-color:var(--warn-line);color:var(--warn)}
 .ek-school{background:var(--fun-bg);border-color:var(--fun-line);color:var(--fun)}
-.ek-due{background:var(--warn);border-color:var(--warn);color:#fff}
+.ek-due{background:var(--warn);border-color:var(--warn);color:var(--on-warn)}
 .ek-etc{background:var(--soft);border-color:var(--line);color:var(--muted)}
 .on{font-size:10.5px;font-weight:800;color:var(--brand-ink);white-space:nowrap}
 .evlabel{font-weight:700;color:var(--ink);flex:1 1 260px;min-width:0}
@@ -486,6 +552,88 @@ a.evmem:hover{border-color:var(--brand70);color:var(--brand-ink)}
 .evrepeat{font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:999px;border:1px dashed var(--line);
   color:var(--muted);white-space:nowrap}
 .evspan{font-size:12.5px;color:var(--muted)}
+
+/* 일대기 — 연도·월 구분선이 있는 세로 타임라인 */
+.sec-timeline{color:var(--ink);margin-top:36px}
+.sec-timeline .sectag{background:var(--brand-soft);color:var(--brand-ink)}
+.tlyear+.tlyear{margin-top:16px;padding-top:15px;border-top:1px solid var(--line)}
+.tlyhead{display:flex;align-items:baseline;gap:8px;font-size:15px;font-weight:800;color:var(--ink);
+  margin:0 0 10px;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.tlyhead i{font-style:normal;font-size:11.5px;font-weight:700;color:var(--muted)}
+.tlmonth+.tlmonth{margin-top:10px;padding-top:9px;border-top:1px dashed var(--line2)}
+.tlmhead{font-size:11.5px;font-weight:700;color:var(--brand-ink);margin:0 0 7px;
+  font-variant-numeric:tabular-nums}
+.tl{list-style:none;padding:0;margin:0 0 0 18px;position:relative}
+.tl::before{content:"";position:absolute;left:-13px;top:8px;bottom:8px;width:2px;background:var(--line)}
+.tl li{position:relative;display:flex;flex-wrap:wrap;align-items:baseline;gap:9px;margin:0 0 10px;
+  font-size:13.5px;line-height:1.55}
+.tl li:last-child{margin-bottom:0}
+.tl li::before{content:"";position:absolute;left:-17px;top:.42em;width:10px;height:10px;border-radius:50%;
+  background:var(--card);border:2px solid var(--brand)}
+.tldate{font-variant-numeric:tabular-nums;font-weight:800;color:var(--brand-ink);font-size:12.5px;
+  min-width:52px;white-space:nowrap}
+.tk{font-size:11px;font-weight:800;padding:2px 9px;border-radius:999px;white-space:nowrap;
+  background:var(--soft);border:1px solid var(--line);color:var(--ink2)}
+.tk-family{background:var(--brand-soft);border-color:var(--brand-line);color:var(--brand-ink)}
+.tk-trip{background:var(--ok-soft);border-color:var(--ok-soft);color:var(--ok)}
+.tk-home{background:var(--fun-soft);border-color:var(--fun-line);color:var(--fun)}
+.tk-health{background:var(--warn-soft);border-color:var(--warn-line);color:var(--warn)}
+.tk-kid{background:var(--fun70);border-color:var(--fun70);color:var(--on-brand)}
+.tk-work{background:var(--soft);border-color:var(--line);color:var(--ink2)}
+.tk-anniv{background:var(--brand);border-color:var(--brand);color:var(--on-brand)}
+.tk-etc{background:var(--line2);border-color:var(--line);color:var(--muted)}
+.tltitle{font-weight:700;color:var(--ink);flex:1 1 240px;min-width:0;
+  word-break:keep-all;overflow-wrap:anywhere}
+.tlmem{font-size:11.5px;background:var(--soft);border:1px solid var(--line);border-radius:999px;
+  padding:2px 9px;color:var(--ink2);text-decoration:none;white-space:nowrap}
+a.tlmem:hover{border-color:var(--brand70);color:var(--brand-ink)}
+.moreline{margin-top:14px}
+.more{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:700;
+  color:var(--brand-ink);text-decoration:none;background:var(--brand-soft);
+  border:1px solid var(--brand-line);border-radius:999px;padding:6px 14px}
+.more:hover{border-color:var(--brand)}
+
+/* 여행 지도 — 인라인 SVG. 외부 타일·JS 없이 Natural Earth 윤곽선만 그린다 (map_data.py) */
+.sec-travel{color:var(--ink);margin-top:36px}
+.sec-travel .sectag{background:var(--fun-soft);color:var(--fun)}
+.tvbadges{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}
+.tvbadge{font-size:11.5px;font-weight:800;padding:3px 11px;border-radius:999px;
+  background:var(--fun70);color:var(--on-brand)}
+.tvbadge.dom{background:var(--brand)}
+.maps{display:grid;grid-template-columns:minmax(0,1.9fr) minmax(0,1fr);gap:14px;align-items:start}
+.mapbox{background:var(--map-sea);border:1px solid var(--line);border-radius:14px;padding:11px 12px 9px;
+  overflow-x:auto;-webkit-overflow-scrolling:touch}
+.mapk{font-size:11.5px;font-weight:700;color:var(--muted);margin:0 0 7px}
+.mapbox svg{display:block;width:100%;height:auto}
+.map-world svg{min-width:560px}
+.map-korea svg{min-width:200px}
+.land{fill:var(--map-land);stroke:var(--map-line);stroke-width:.5px;stroke-linejoin:round;
+  vector-effect:non-scaling-stroke}
+.hop{fill:none;stroke:var(--map-line);stroke-width:1.2px;stroke-dasharray:4 4;
+  vector-effect:non-scaling-stroke;opacity:.85}
+.pin circle{stroke:var(--map-line);stroke-width:1.2px;vector-effect:non-scaling-stroke}
+.pin.dom circle{fill:var(--brand)}
+.pin.abr circle{fill:var(--fun70)}
+.pin text{fill:var(--on-brand);font-weight:800;text-anchor:middle;dominant-baseline:central;
+  letter-spacing:-.04em}
+.tvlist{list-style:none;padding:0;margin:0}
+.tvitem+.tvitem{margin-top:13px;padding-top:13px;border-top:1px solid var(--line2)}
+.tvhead{display:flex;flex-wrap:wrap;align-items:baseline;gap:9px}
+.tvno{font-size:11px;font-weight:800;width:21px;height:21px;border-radius:50%;display:inline-grid;
+  place-items:center;background:var(--fun70);color:var(--on-brand);
+  font-variant-numeric:tabular-nums;flex:0 0 auto}
+.tvitem.dom .tvno{background:var(--brand)}
+.tvname{font-size:15px;font-weight:800;color:var(--ink);letter-spacing:-.02em}
+.tvspan{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.tvkind{font-size:11px;font-weight:800;padding:2px 9px;border-radius:999px;
+  background:var(--fun-soft);color:var(--fun);border:1px solid var(--fun-line)}
+.tvitem.dom .tvkind{background:var(--brand-soft);color:var(--brand-ink);border-color:var(--brand-line)}
+.tvstops{font-size:12.5px;color:var(--ink2);margin-top:6px;word-break:keep-all;overflow-wrap:anywhere}
+.tvchips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.tvchip{font-size:11.5px;background:var(--soft);border:1px solid var(--line);border-radius:999px;
+  padding:3px 10px;color:var(--ink2)}
+.tvchip.hl{background:var(--fun-bg);border-color:var(--fun-line);color:var(--fun);font-weight:700}
+.tvcard+.tvcard{margin-top:14px}
 
 /* 관측 신호 접기 */
 details.sig{margin-top:36px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:0 20px}
@@ -524,6 +672,7 @@ footer{margin-top:52px;padding-top:20px;border-top:1px solid var(--line);font-si
   .tri::after{width:90px;height:90px;left:-10px;top:140px}
   .grid2,.talk-grid,.talk-meta{grid-template-columns:1fr}
   .fun3{grid-template-columns:1fr}
+  .maps{grid-template-columns:1fr}
   .pcard{grid-template-columns:1fr;gap:18px;padding:20px}
   .paside{border-left:0;padding-left:0;border-top:1px solid var(--line2);padding-top:18px}
 }
@@ -536,8 +685,10 @@ footer{margin-top:52px;padding-top:20px;border-top:1px solid var(--line);font-si
   .card,.talk,.mcard,.pcard{padding:16px}
   .secsub{margin-left:0;width:100%}
   .ms .d{display:block;min-width:0;margin:0}
-  .chsum,.evlabel{flex:1 1 100%}
+  .chsum,.evlabel,.tltitle{flex:1 1 100%}
   .evtime{min-width:0}
+  .tl{margin-left:15px}
+  .mapbox{padding:9px 10px 7px}
 }
 """
 
@@ -1111,6 +1262,317 @@ def daily_html(daily: dict[str, Any] | None, today: date) -> str:
     return f'<div class="card">{"".join(blocks)}</div>'
 
 
+# ─────────────────────────────────────────────────────────── 일대기 (세로 타임라인)
+
+
+def member_chips(names: list[str], member_hrefs: dict[str, str], cls: str, prefix: str = "") -> str:
+    """호칭 칩. 가족 카드가 있는 사람은 상세로 잇는다 (없으면 글자만)."""
+    out = []
+    for n in names:
+        href = member_hrefs.get(n)
+        out.append(
+            f'<a class="{cls}" href="{esc(prefix + href)}">{esc(n)}</a>' if href else f'<span class="{cls}">{esc(n)}</span>'
+        )
+    return "".join(out)
+
+
+def fmt_md(s: object) -> str:
+    """`10/7` — 연도는 연도 머리가 들고 있다."""
+    d = parse_day(s)
+    return f"{d.month}/{d.day}" if d else text(s)
+
+
+def timeline_span(e: dict[str, Any]) -> str:
+    """하루면 `2/21`, 기간이면 `10/7 ~ 10/20`. 해를 넘기면 끝에 연도를 붙인다."""
+    start, end = text(e.get("date")), text(e.get("end"))
+    if not end or end == start:
+        return fmt_md(start)
+    a, b = parse_day(start), parse_day(end)
+    if a and b and a.year != b.year:
+        return f"{fmt_md(start)} ~ {b.year}.{b.month}/{b.day}"
+    return f"{fmt_md(start)} ~ {fmt_md(end)}"
+
+
+def timeline_item_html(e: dict[str, Any], member_hrefs: dict[str, str], prefix: str = "") -> str:
+    kind = text(e.get("kind"))
+    row = f'<span class="tldate">{esc(timeline_span(e))}</span>'
+    row += f'<span class="tk {TIMELINE_KIND_CLASS.get(kind, "tk-etc")}">{esc(kind)}</span>'
+    row += f'<span class="tltitle">{esc(text(e.get("title")))}</span>'
+    row += member_chips(str_list(e.get("members")), member_hrefs, "tlmem", prefix)
+    # `note`(비고)는 그리지 않는다 — 일정 카드와 같은 규칙이다 (검증기가 비어 있지 않으면 거부한다).
+    return f"<li>{row}</li>"
+
+
+def _by_year_month(entries: list[dict[str, Any]]) -> list[tuple[str, list[tuple[str, list[dict[str, Any]]]]]]:
+    """받은 순서를 그대로 지키며 연도 → 월로 묶는다 (정렬은 부르는 쪽 몫이다)."""
+    years: list[tuple[str, list[tuple[str, list[dict[str, Any]]]]]] = []
+    for e in entries:
+        day = text(e.get("date"))
+        y, m = day[:4], day[5:7]
+        if not years or years[-1][0] != y:
+            years.append((y, []))
+        months = years[-1][1]
+        if not months or months[-1][0] != m:
+            months.append((m, []))
+        months[-1][1].append(e)
+    return years
+
+
+def timeline_html(entries: list[dict[str, Any]], member_hrefs: dict[str, str], prefix: str = "") -> str:
+    """연도·월 구분선이 있는 세로 타임라인. 받은 순서대로 그린다 — 최신이 위다.
+
+    목록 페이지는 최근 `SITE_TIMELINE_ITEMS` 건만 넣고 전체는 상세 페이지에 있다 (`t/timeline.html`).
+    """
+    if not entries:
+        return card("", f'<p class="empty">{esc(TIMELINE_EMPTY)}</p>')
+    blocks = []
+    for year, months in _by_year_month(entries):
+        n = sum(len(items) for _, items in months)
+        head = f'<div class="tlyhead">{esc(year)}년<i>{n}건</i></div>'
+        mb = []
+        for month, items in months:
+            lis = "".join(timeline_item_html(e, member_hrefs, prefix) for e in items)
+            label = f"{int(month)}월" if month.isdigit() else esc(month)
+            mb.append(f'<div class="tlmonth"><div class="tlmhead">{label}</div><ul class="tl">{lis}</ul></div>')
+        blocks.append(f'<div class="tlyear">{head}{"".join(mb)}</div>')
+    return f'<div class="card">{"".join(blocks)}</div>'
+
+
+def render_timeline_page(entries: list[dict[str, Any]], group: str, built: str, member_hrefs: dict[str, str]) -> str:
+    """일대기 전체 한 장 (`t/timeline.html`). 연도별 묶음이고 최신 연도가 위다."""
+    years = len({text(e.get("date"))[:4] for e in entries})
+    chips = [f'<span class="chip"><b>사건</b>{len(entries)}건</span>']
+    if years:
+        chips.append(f'<span class="chip"><b>연도</b>{years}해</span>')
+    chips.append(f'<span class="chip"><b>빌드</b>{esc(built)}</span>')
+    hero = (
+        '<header class="hero"><span class="tri" aria-hidden="true"></span><div class="in">'
+        '<a class="back" href="../index.html#timeline">← 목록</a>'
+        f'<div class="hero-eyebrow">일대기 · {esc(group)}</div><h1 class="hero-title">가족 일대기</h1>'
+        '<div class="hero-sub">가족사에 남을 일만 골라 적었다. 자세한 사정은 위키 본문에 있고 여기에는 싣지 않는다.</div>'
+        f'<div class="hero-chips">{"".join(chips)}</div></div></header>'
+    )
+    body = (
+        hero + '<main class="wrap">'
+        + sec("sec-timeline", "전체", "가족 일대기", timeline_html(entries, member_hrefs, "../"), "최신 연도가 위")
+        + footer_html(group, built) + "</main>"
+    )
+    return html_doc(f"가족 일대기 · {group}", body)
+
+
+# ──────────────────────────────────────────────────── 여행 지도 (인라인 SVG · 외부 타일 없음)
+
+
+def _n(v: float) -> str:
+    """SVG 좌표 — 소수 셋째 자리까지. 등장방형이라 1도가 100km 대다."""
+    s = f"{v:.3f}".rstrip("0").rstrip(".")
+    return "0" if s in ("", "-0", "-") else s
+
+
+def _viewbox_box(viewbox: str) -> tuple[float, float, float, float]:
+    x0, y0, w, h = (float(v) for v in viewbox.split())
+    return x0, y0, w, h
+
+
+def spread_pins(points: list[tuple[float, float]], r: float, box: tuple[float, float, float, float]) -> list[tuple[float, float]]:
+    """거의 완전히 겹친 핀만 살짝 벌린다 — 앞 핀은 그대로 두고 뒤 핀을 여덟 방향으로 한 칸씩 밀어 본다.
+
+    같은 도시를 두 번 갔거나 두 여행이 같은 곳을 들렀을 때 핀 하나만 보이는 것을 막는 장치다.
+    이웃 도시(세계 지도에서 핀 반지름 안에 드는 거리)는 **밀지 않는다** — 밀면 핀이 딴 나라에 찍힌다.
+    결과는 항상 viewBox 안이다 (밀다가 지도 밖으로 나가면 경계로 당긴다).
+    """
+    x0, y0, w, h = box
+    near, step_d = PIN_OVERLAP * r, PIN_SPREAD * r
+    placed: list[tuple[float, float]] = []
+    out: list[tuple[float, float]] = []
+    for x, y in points:
+        nx, ny = x, y
+        for step in range(17):
+            if all((nx - px) ** 2 + (ny - py) ** 2 >= near * near for px, py in placed):
+                break
+            ring, idx = divmod(step, 8)
+            ang = math.radians(45 * idx + 22.5 * ring)
+            d = step_d * (ring + 1)
+            nx, ny = x + d * math.cos(ang), y + d * math.sin(ang)
+        nx = min(max(nx, x0 + r), x0 + w - r)
+        ny = min(max(ny, y0 + r), y0 + h - r)
+        placed.append((nx, ny))
+        out.append((nx, ny))
+    return out
+
+
+def trip_span(t: dict[str, Any]) -> str:
+    """`2025.10.7~10.20 · 13박`. 하루짜리면 날짜만."""
+    a, b = parse_day(t.get("start")), parse_day(t.get("end"))
+    if not a:
+        return text(t.get("start"))
+    if not b or b == a:
+        return f"{a.year}.{a.month}.{a.day}"
+    if (a.year, a.month) == (b.year, b.month):
+        span = f"{a.year}.{a.month}.{a.day}~{b.day}"
+    elif a.year == b.year:
+        span = f"{a.year}.{a.month}.{a.day}~{b.month}.{b.day}"
+    else:
+        span = f"{a.year}.{a.month}.{a.day}~{b.year}.{b.month}.{b.day}"
+    nights = (b - a).days
+    return f"{span} · {nights}박" if nights > 0 else span
+
+
+def pin_rows(trips: list[dict[str, Any]], scope: str) -> list[tuple[int, list[tuple[float, float, str]]]]:
+    """(여행 번호, [(x, y, 툴팁)]) — `scope` 는 `해외`(세계 지도)·`국내`(한국 인셋).
+
+    번호는 여행 순서다 (`travel_trips` 가 `start` 오름차순으로 준다). 좌표계는 그 지도의 viewBox 와 같다.
+    """
+    project = project_korea if scope == "국내" else project_world
+    rows = []
+    for i, t in enumerate(trips, start=1):
+        if text(t.get("kind")) != scope:
+            continue
+        pts = []
+        for s in trip_stops(t):
+            x, y = project(float(s["lat"]), float(s["lon"]))
+            pts.append((x, y, f"{i} · {text(s.get('name'))} · {text(t.get('title'))} · {trip_span(t)}"))
+        if pts:
+            rows.append((i, pts))
+    return rows
+
+
+def map_svg(
+    box_class: str,
+    land_path: str,
+    viewbox: str,
+    rows: list[tuple[int, list[tuple[float, float, str]]]],
+    pin_class: str,
+    label: str,
+    pin_scale: float = 1.0,
+) -> str:
+    """윤곽선 + 핀 + 같은 여행을 잇는 점선. 좌표는 경위도 그대로다 (등장방형).
+
+    핀 크기는 viewBox 폭에 맞춘다 — 세계(360도)와 한국 인셋(6도 남짓)에 같은 수치를 쓸 수 없다.
+    선 굵기는 CSS 의 `vector-effect:non-scaling-stroke` 가 잡아 준다 (확대해도 실선이 두꺼워지지 않는다).
+    """
+    x0, y0, w, h = _viewbox_box(viewbox)
+    r = w * PIN_R_RATIO * pin_scale
+    fs = w * PIN_FONT_RATIO * pin_scale
+    flat = [(x, y) for _, pts in rows for x, y, _ in pts]
+    moved = spread_pins(flat, r, (x0, y0, w, h))
+    it = iter(moved)
+    hops, pins = [], []
+    for no, pts in rows:
+        placed = [(next(it), tip) for _, _, tip in pts]
+        if len(placed) > 1:  # 같은 여행의 경유지는 점선으로 잇는다
+            d = "M" + "L".join(f"{_n(x)} {_n(y)}" for (x, y), _ in placed)
+            hops.append(f'<path class="hop" d="{d}"/>')
+        for (x, y), tip in placed:
+            pins.append(
+                f'<g class="pin {pin_class}"><title>{esc(tip)}</title>'
+                f'<circle cx="{_n(x)}" cy="{_n(y)}" r="{_n(r)}"/>'
+                f'<text x="{_n(x)}" y="{_n(y)}" font-size="{_n(fs)}">{no}</text></g>'
+            )
+    return (
+        f'<div class="mapbox {box_class}"><div class="mapk">{esc(label)}</div>'
+        f'<svg viewBox="{esc(viewbox)}" role="img" aria-label="{esc(label)}">'
+        # 윤곽선도 esc() 를 거친다 — 생성물이라 숫자와 M·L·Z 뿐이지만 예외를 두지 않는다
+        f'<path class="land" d="{esc(land_path)}"/>{"".join(hops)}{"".join(pins)}</svg></div>'
+    )
+
+
+def maps_html(trips: list[dict[str, Any]]) -> str:
+    """세계 지도(해외) + 한국 인셋(국내). 핀이 없는 쪽은 그리지 않는다."""
+    boxes = []
+    abroad = pin_rows(trips, "해외")
+    if abroad:
+        boxes.append(map_svg("map-world", WORLD_PATH, WORLD_VIEWBOX, abroad, "abr", "세계 · 해외 여행지"))
+    domestic = pin_rows(trips, "국내")
+    if domestic:
+        boxes.append(
+            map_svg("map-korea", KOREA_PATH, KOREA_VIEWBOX, domestic, "dom", "한국 · 국내 여행지", KOREA_PIN_SCALE)
+        )
+    if not boxes:
+        return ""
+    return f'<div class="maps">{"".join(boxes)}</div>'
+
+
+def _trip_head(no: int, t: dict[str, Any]) -> str:
+    kind = text(t.get("kind"))
+    return (
+        f'<div class="tvhead"><span class="tvno">{no}</span>'
+        f'<span class="tvname">{esc(text(t.get("title")) or text(t.get("id")))}</span>'
+        f'<span class="tvkind">{esc(kind)}</span>'
+        f'<span class="tvspan">{esc(trip_span(t))}</span></div>'
+    )
+
+
+def _trip_body(t: dict[str, Any], member_hrefs: dict[str, str], prefix: str) -> str:
+    stops = " → ".join(text(s.get("name")) for s in trip_stops(t) if text(s.get("name")))
+    out = f'<div class="tvstops">{esc(stops)}</div>' if stops else ""
+    chips = member_chips(str_list(t.get("members")), member_hrefs, "tvchip", prefix)
+    chips += "".join(f'<span class="tvchip hl">{esc(x)}</span>' for x in str_list(t.get("highlights")))
+    return out + (f'<div class="tvchips">{chips}</div>' if chips else "")
+
+
+def trip_list_html(trips: list[dict[str, Any]], member_hrefs: dict[str, str], prefix: str = "") -> str:
+    """지도 아래 여행 목록 — 기간 · 여행지 · 누구 · 하이라이트 칩. 번호는 지도 핀과 같다."""
+    items = []
+    for i, t in enumerate(trips, start=1):
+        cls = "tvitem dom" if text(t.get("kind")) == "국내" else "tvitem"
+        items.append(f'<li class="{cls}">{_trip_head(i, t)}{_trip_body(t, member_hrefs, prefix)}</li>')
+    return f'<div class="card"><ul class="tvlist">{"".join(items)}</ul></div>'
+
+
+def trip_cards_html(trips: list[dict[str, Any]], member_hrefs: dict[str, str], prefix: str = "") -> str:
+    """상세 페이지의 여행별 카드 — 목록보다 한 건에 자리를 더 준다."""
+    out = []
+    for i, t in enumerate(trips, start=1):
+        cls = "card tvcard tvitem dom" if text(t.get("kind")) == "국내" else "card tvcard tvitem"
+        out.append(f'<div class="{cls}">{_trip_head(i, t)}{_trip_body(t, member_hrefs, prefix)}</div>')
+    return "".join(out)
+
+
+def travel_badges(trips: list[dict[str, Any]]) -> str:
+    abroad = sum(1 for t in trips if text(t.get("kind")) == "해외")
+    domestic = sum(1 for t in trips if text(t.get("kind")) == "국내")
+    return (
+        f'<div class="tvbadges"><span class="tvbadge">해외 {abroad}</span>'
+        f'<span class="tvbadge dom">국내 {domestic}</span></div>'
+    )
+
+
+def travel_html(trips: list[dict[str, Any]], member_hrefs: dict[str, str], prefix: str = "", detail: bool = False) -> str:
+    """지도 + 여행 목록. 여행이 없으면 지도 없이 한 줄만 (정본 §2)."""
+    if not trips:
+        return card("", f'<p class="empty">{esc(TRAVEL_EMPTY)}</p>')
+    maps = maps_html(trips)
+    top = f'<div class="card">{travel_badges(trips)}{maps}</div>' if maps else card("", travel_badges(trips))
+    listing = trip_cards_html(trips, member_hrefs, prefix) if detail else trip_list_html(trips, member_hrefs, prefix)
+    return top + listing
+
+
+def render_travels_page(trips: list[dict[str, Any]], group: str, built: str, member_hrefs: dict[str, str]) -> str:
+    """여행 전체 한 장 (`t/travels.html`) — 큰 지도 + 여행별 카드."""
+    abroad = sum(1 for t in trips if text(t.get("kind")) == "해외")
+    chips = [
+        f'<span class="chip"><b>여행</b>{len(trips)}건</span>',
+        f'<span class="chip"><b>해외</b>{abroad}건</span>',
+        f'<span class="chip"><b>국내</b>{len(trips) - abroad}건</span>',
+        f'<span class="chip"><b>빌드</b>{esc(built)}</span>',
+    ]
+    hero = (
+        '<header class="hero"><span class="tri" aria-hidden="true"></span><div class="in">'
+        '<a class="back" href="../index.html#travels">← 목록</a>'
+        f'<div class="hero-eyebrow">여행 · {esc(group)}</div><h1 class="hero-title">우리가 다녀온 곳</h1>'
+        '<div class="hero-sub">핀 번호는 여행 순서다. 같은 여행의 경유지는 점선으로 이었다. '
+        '좌표는 도시 수준 근사값이고 숙소·예약 정보는 싣지 않는다.</div>'
+        f'<div class="hero-chips">{"".join(chips)}</div></div></header>'
+    )
+    body = (
+        hero + '<main class="wrap">'
+        + sec("sec-travel", "전체", "여행 지도", travel_html(trips, member_hrefs, "../", detail=True), "핀을 누르면 지명이 보인다")
+        + footer_html(group, built) + "</main>"
+    )
+    return html_doc(f"우리가 다녀온 곳 · {group}", body)
+
+
 # ───────────────────────────────────────────────────────────────────── 목록·빌드
 
 
@@ -1152,11 +1614,14 @@ def render_index(
     today: date | None = None,
     daily: dict[str, Any] | None = None,
     now_hm: str = "",
+    timeline: dict[str, Any] | None = None,
+    travels: dict[str, Any] | None = None,
 ) -> str:
-    """목록 페이지. 섹션 순서는 하루 요약 → 가족 일정 → 계획 → 가족 → 최근 변경.
+    """목록 페이지. 섹션 순서는 하루 요약 → 가족 일정 → 일대기 → 여행 지도 → 계획 → 가족 → 최근 변경.
 
     `today` 는 하루 요약(어제·오늘)·가족 일정(오늘부터 달력일 3일)·최근 7일 창의 기준일이다 (기본 KST 오늘).
     `now_hm` 은 빌드 시각 `HH:MM` — 오늘 일정 중 지난 항목에 취소선을 긋는 기준. 비우면 날짜만 본다. 테스트가 날짜를 고정한다.
+    일대기는 최근 `SITE_TIMELINE_ITEMS` 건만, 여행은 전부 그린다 — 전체·상세는 `t/timeline.html`·`t/travels.html`.
     """
     today = today or datetime.now(KST).date()
     member_hrefs = {text(d.get("name")): href_for("m", d) for d in profiles}
@@ -1165,9 +1630,14 @@ def render_index(
     events = events_in_window(schedule, today, SITE_SCHEDULE_DAYS) if schedule else []
     changes = entries_within(changelog, today) if changelog else []
     win_start, win_end = day_window(today, SITE_SCHEDULE_DAYS)
+    # 일대기는 최신이 위다 — 목록에는 최근 12건, 전체는 t/timeline.html. 여행 핀 번호는 여행 순서(오래된 것이 1번)다.
+    story = list(reversed(timeline_entries(timeline)))
+    trips = travel_trips(travels)
 
     chips = [f'<span class="chip"><b>가족</b>{len(profiles)}명</span>', f'<span class="chip"><b>계획</b>{len(projects)}건</span>']
     chips.append(f'<span class="chip"><b>일정</b>{len(events)}건</span>')
+    chips.append(f'<span class="chip"><b>일대기</b>{len(story)}건</span>')
+    chips.append(f'<span class="chip"><b>여행</b>{len(trips)}건</span>')
     chips.append(f'<span class="chip"><b>변경</b>{len(changes)}건</span>')
     chips.append(f'<span class="chip"><b>빌드</b>{esc(built)}</span>')
     if generated:
@@ -1177,23 +1647,41 @@ def render_index(
         chips.append(f'<span class="chip"><b>표본 부족</b>{low_n}명</span>')
     hero = (
         '<header class="hero"><span class="tri" aria-hidden="true"></span><div class="in">'
-        '<div class="hero-eyebrow">하루 요약 · 가족 일정 · 계획 · 가족 · 최근 변경</div>'
+        '<div class="hero-eyebrow">오늘의 우리 집 · 하루 요약 · 가족 일정 · 일대기 · 여행 지도 · 계획 · 가족 · 최근 변경</div>'
         f'<h1 class="hero-title">{esc(group)}</h1>'
-        f"<div class=\"hero-sub\">어제와 오늘 가족 방에 오간 일의 요약과 오늘부터 {SITE_SCHEDULE_DAYS}일(오늘·내일·모레) 안의 가족 일정, "
-        f"가고 있는 계획 요약, 가족 카톡방에서 집계한 말투 신호로 만든 가족 카드, 최근 {CHANGELOG_KEEP_DAYS}일간 바뀐 카드. "
+        f"<div class=\"hero-sub\">어제와 오늘 우리 방에 오간 이야기, 오늘부터 {SITE_SCHEDULE_DAYS}일(오늘·내일·모레) 안의 가족 일정, "
+        "가족사에 남을 일과 다녀온 곳, "
+        f"함께 가고 있는 계획, 카톡방 말투에서 모은 가족 카드, 최근 {CHANGELOG_KEEP_DAYS}일간 바뀐 것들을 한 장에 모았다. "
         "위키 본문과 원본 대화는 여기에 실리지 않는다.</div>"
         f'<div class="hero-chips">{"".join(chips)}</div></div></header>'
     )
     s_daily = sec(
         "sec-daily", "어제 · 오늘", "하루 요약",
         daily_html(daily, today),
-        "어제와 오늘 · 가족 방에 오간 일을 정리할 때 한 줄씩 요약 · 원문은 싣지 않는다",
+        "어제와 오늘 · 우리 방에 오간 이야기를 한 줄씩 · 원문은 싣지 않는다",
     )
     s_sched = sec(
         "sec-sched", f"{SITE_SCHEDULE_DAYS}일", "가족 일정",
         schedule_html(events, today, member_hrefs, now_hm, holidays) + holiday_note(schedule, win_start, win_end),
         f"{fmt_day(win_start)} ~ {fmt_day(win_end)} · 오늘·내일·모레 (주말 포함) · 지난 일정은 취소선"
         + (f" · 데이터 기준 {esc(text(schedule.get('generated')))}" if schedule and text(schedule.get("generated")) else ""),
+    )
+    shown = story[:SITE_TIMELINE_ITEMS]
+    more = (
+        f'<div class="moreline"><a class="more" href="t/timeline.html">전체 보기 · {len(story)}건</a></div>'
+        if len(story) > len(shown)
+        else ""
+    )
+    s_timeline = '<div id="timeline"></div>' + sec(
+        "sec-timeline", "연대기", "일대기",
+        timeline_html(shown, member_hrefs) + more,
+        (f"최근 {len(shown)}건 · 최신이 위 · 자세한 사정은 위키 본문에" if shown else "가족사에 남을 일만 골라 적는다"),
+    )
+    s_travel = '<div id="travels"></div>' + sec(
+        "sec-travel", "지도", "여행 지도",
+        travel_html(trips, member_hrefs)
+        + (f'<div class="moreline"><a class="more" href="t/travels.html">전체 보기 · {len(trips)}건</a></div>' if trips else ""),
+        "핀 번호는 여행 순서 · 국내는 하늘색 · 해외는 민트" if trips else "다녀온 곳을 지도에 찍는다",
     )
     if projects:
         pcards = f'<div class="pcards">{"".join(project_card(d, project_hrefs[text(d.get("name"))]) for d in projects)}</div>'
@@ -1211,7 +1699,11 @@ def render_index(
         "카드가 언제 무엇 때문에 바뀌었나",
     )
     skips = skipped_html(skipped)
-    body = hero + banner_html() + '<main class="wrap">' + s_daily + s_sched + s_projects + s_members + s_changes + skips + footer_html(group, built) + "</main>"
+    body = (
+        hero + banner_html() + '<main class="wrap">'
+        + s_daily + s_sched + s_timeline + s_travel + s_projects + s_members + s_changes
+        + skips + footer_html(group, built) + "</main>"
+    )
     return html_doc(f"{group} 카드", body)
 
 
@@ -1229,8 +1721,10 @@ def build(cards: list[Card], out_dir: Path) -> None:
     schedule = next((c.data for c in cards if c.ok and c.kind == "schedule" and c.data is not None), None)
     changelog = next((c.data for c in cards if c.ok and c.kind == "changelog" and c.data is not None), None)
     daily = next((c.data for c in cards if c.ok and c.kind == "daily" and c.data is not None), None)
+    timeline = next((c.data for c in cards if c.ok and c.kind == "timeline" and c.data is not None), None)
+    travels = next((c.data for c in cards if c.ok and c.kind == "travel" and c.data is not None), None)
     skipped = [c for c in cards if not c.ok]
-    named = profiles + projects + [d for d in (schedule, changelog, daily) if d is not None]
+    named = profiles + projects + [d for d in (schedule, changelog, daily, timeline, travels) if d is not None]
     group = next((text(d.get("group")) for d in named if text(d.get("group"))), DEFAULT_GROUP)
     generated = max((text(d.get("generated")) for d in profiles + projects), default="")
     now = datetime.now(KST)
@@ -1244,7 +1738,19 @@ def build(cards: list[Card], out_dir: Path) -> None:
         (out_dir / "m" / f"{text(d.get('name'))}.html").write_text(render_person(d, built), encoding="utf-8")
     for d in projects:
         (out_dir / "p" / f"{text(d.get('name'))}.html").write_text(render_project(d, built, member_hrefs), encoding="utf-8")
-    index = render_index(profiles, projects, skipped, group, built, generated, schedule, changelog, today, daily, now.strftime("%H:%M"))
+
+    # 일대기 전체·여행 전체는 한 장씩 `t/` 에 둔다. 카드가 0건이어도 만든다 — 목록의 "전체 보기" 링크가
+    # 깨지지 않게 (0건이면 빈 상태 문구만 있는 페이지다).
+    story = list(reversed(timeline_entries(timeline)))
+    trips = travel_trips(travels)
+    (out_dir / "t").mkdir(parents=True, exist_ok=True)
+    (out_dir / "t" / "timeline.html").write_text(render_timeline_page(story, group, built, member_hrefs), encoding="utf-8")
+    (out_dir / "t" / "travels.html").write_text(render_travels_page(trips, group, built, member_hrefs), encoding="utf-8")
+
+    index = render_index(
+        profiles, projects, skipped, group, built, generated, schedule, changelog, today, daily,
+        now.strftime("%H:%M"), timeline, travels,
+    )
     (out_dir / "index.html").write_text(index, encoding="utf-8")
     (out_dir / ".nojekyll").write_text("", encoding="utf-8")  # Jekyll 후처리 방지
     n_events = len(events_in_window(schedule, today, SITE_SCHEDULE_DAYS)) if schedule else 0
@@ -1252,7 +1758,8 @@ def build(cards: list[Card], out_dir: Path) -> None:
     n_daily = sum(len(r.get("items") or []) for d in daily_days(daily, today) for r in d["rooms"])
     print(
         f"{out_dir}/index.html 생성 — 가족 {len(profiles)}명 · 계획 {len(projects)}건 · "
-        f"하루 요약 {n_daily}줄 · 일정 {n_events}건 · 변경 {n_changes}건 · 건너뜀 {len(skipped)}건",
+        f"하루 요약 {n_daily}줄 · 일정 {n_events}건 · 일대기 {len(story)}건 · 여행 {len(trips)}건 · "
+        f"변경 {n_changes}건 · 건너뜀 {len(skipped)}건",
         file=sys.stderr,
     )
 

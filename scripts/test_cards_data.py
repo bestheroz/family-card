@@ -2,7 +2,8 @@
 """cards_data.py 의 검증 규칙과 build_site.py 의 공개 범위를 테스트한다.
 
 근거: family-wiki 의 docs/PROFILE_SCHEMA.md · docs/PROJECT_SCHEMA.md · docs/SCHEDULE_SCHEMA.md ·
-docs/CHANGELOG_SCHEMA.md · docs/DAILY_SCHEMA.md · docs/PRIVACY.md. 표준 라이브러리만 쓴다.
+docs/CHANGELOG_SCHEMA.md · docs/DAILY_SCHEMA.md · docs/TIMELINE_SCHEMA.md · docs/TRAVELS_SCHEMA.md ·
+docs/PRIVACY.md. 표준 라이브러리만 쓴다.
 
 픽스처의 사람 이름은 실명이 아니라 호칭이다 (아빠·엄마·첫째). 그룹 이름도 가상("우리집")을 쓴다 —
 기본 그룹 이름은 `cards_data.DEFAULT_GROUP` 으로만 참조한다.
@@ -12,11 +13,13 @@ docs/CHANGELOG_SCHEMA.md · docs/DAILY_SCHEMA.md · docs/PRIVACY.md. 표준 라�
 from __future__ import annotations
 
 import base64
+import colorsys
 import copy
 import datetime
 import json
 import os
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -28,6 +31,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import build_site  # noqa: E402
 import cards_data  # noqa: E402
+import map_data  # noqa: E402
 
 GROUP = "우리집"
 
@@ -171,6 +175,53 @@ def make_changelog() -> dict:
     }
 
 
+def make_timeline() -> dict:
+    """docs/TIMELINE_SCHEMA.md 기준의 정상 일대기 — 기간 항목과 하루 항목을 섞어 둔다."""
+    return {
+        "schema_version": 1,
+        "group": GROUP,
+        "generated": "2026-09-22",
+        "sources": ["wiki:family/가족-연대기"],
+        "entries": [
+            {
+                "date": "2025-10-07", "end": "2025-10-20", "kind": "여행", "title": "포르투갈 13박 여행",
+                "members": ["아빠", "엄마", "첫째"], "note": "",
+            },
+            {"date": "2026-02-21", "end": "", "kind": "집", "title": "새 집으로 이사", "members": [], "note": ""},
+        ],
+    }
+
+
+def make_travels() -> dict:
+    """docs/TRAVELS_SCHEMA.md 기준의 정상 여행 — 해외 한 건·국내 한 건, 경유지는 각 두 곳."""
+    return {
+        "schema_version": 1,
+        "group": GROUP,
+        "generated": "2026-09-22",
+        "sources": ["wiki:travel/여행-이력"],
+        "trips": [
+            {
+                "id": "2025-10-포르투갈", "title": "포르투갈", "start": "2025-10-07", "end": "2025-10-20",
+                "kind": "해외", "country": "포르투갈", "members": ["아빠", "엄마", "첫째"],
+                "stops": [
+                    {"name": "리스본", "lat": 38.72, "lon": -9.14},
+                    {"name": "포르투", "lat": 41.15, "lon": -8.61},
+                ],
+                "highlights": ["트램 타고 알파마 언덕", "강변 산책"],
+            },
+            {
+                "id": "2025-12-봉화-태백", "title": "봉화·태백", "start": "2025-12-25", "end": "2025-12-27",
+                "kind": "국내", "country": "대한민국", "members": ["아빠", "엄마", "첫째"],
+                "stops": [
+                    {"name": "봉화", "lat": 36.89, "lon": 128.73},
+                    {"name": "태백", "lat": 37.16, "lon": 128.99},
+                ],
+                "highlights": [],
+            },
+        ],
+    }
+
+
 class 그룹_키_검증(unittest.TestCase):
     """소속 키는 `part` 가 아니라 `group` 이다 (team-plan §1 · §4)."""
 
@@ -195,6 +246,8 @@ class 그룹_키_검증(unittest.TestCase):
             (make_schedule(), cards_data.validate_schedule),
             (make_changelog(), cards_data.validate_changelog),
             (make_daily(), cards_data.validate_daily),
+            (make_timeline(), cards_data.validate_timeline),
+            (make_travels(), cards_data.validate_travels),
         ):
             with self.subTest(kind=type(data).__name__ + str(sorted(data)[:1])):
                 data["part"] = "고객서비스파트"
@@ -827,10 +880,23 @@ class 변경_목록_검증(unittest.TestCase):
     def test_정상_변경목록은_통과(self):
         self.assertEqual(self._errors(make_changelog()), [])
 
-    def test_card는_네_값만(self):
+    def test_card는_정해진_값만(self):
         c = make_changelog()
-        c["entries"][0]["card"] = "일정"
+        c["entries"][0]["card"] = "일정"  # 한글 이름이 아니라 키(`schedule`)를 적어야 한다
         self.assertTrue(any("entries[0].card" in e for e in self._errors(c)))
+
+    def test_일대기와_여행도_card_값이다(self):
+        for value in ("timeline", "travel"):
+            with self.subTest(card=value):
+                c = make_changelog()
+                c["entries"][0]["card"] = value
+                self.assertEqual(self._errors(c), [])
+
+    def test_모든_card_값에_칩_이름과_색이_있다(self):
+        for value in cards_data.CHANGE_CARDS:
+            with self.subTest(card=value):
+                self.assertIn(value, build_site.CHANGE_CARD_KO)
+                self.assertIn(value, build_site.CHANGE_CARD_CLASS)
 
     def test_summary가_비면_거부(self):
         c = make_changelog()
@@ -1323,22 +1389,119 @@ class 목록_페이지(unittest.TestCase):
         self.assertIn('<meta name="robots" content="noindex,nofollow">', self._index())
 
 
+DARK_AT = "@media (prefers-color-scheme:dark)"
+TOKEN_RX = re.compile(r"--([a-z0-9-]+):(#[0-9A-Fa-f]{6})")
+
+# 글자 토큰 → 그 글자가 실제로 얹히는 면 토큰 (CSS 규칙에서 짝지은 것만 적는다).
+# 라이트·다크 두 블록에서 같은 짝을 본다 — 다크에서만 대비가 무너지는 일을 막는다.
+TEXT_ON_SURFACE = (
+    ("ink", "card"), ("ink", "bg"), ("ink2", "card"), ("ink2", "soft"), ("ink2", "bg"),
+    ("muted", "card"), ("muted", "bg"), ("muted", "soft"), ("muted", "line2"),
+    ("brand-ink", "card"), ("brand-ink", "bg"), ("brand-ink", "soft"), ("brand-ink", "brand-soft"),
+    ("fun", "card"), ("fun", "fun-soft"), ("fun", "fun-bg"), ("fun", "soft"),
+    ("ok", "card"), ("ok", "ok-soft"),
+    ("warn", "card"), ("warn", "warn-soft"),
+    # 파스텔 면에 얹는 글자 — 흰 글자가 아니라 짙은 남청이다
+    ("on-brand", "brand"), ("on-brand", "brand70"), ("on-brand", "brand50"),
+    ("on-brand", "fun70"), ("on-brand", "fun50"),
+    ("on-warn", "warn"),
+    # 지도 — 윤곽선이 땅과 바다 위에서 둘 다 보여야 한다 (라이트·다크에서 역할이 뒤집힌다)
+    ("map-line", "map-land"), ("map-line", "map-sea"),
+)
+
+
+def _relative_luminance(hexcode: str) -> float:
+    """WCAG 2.1 상대휘도. 대비 계산은 이 한 곳에서만 한다."""
+    raw = hexcode.lstrip("#")
+    channels = [int(raw[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+    linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def contrast_ratio(fg: str, bg: str) -> float:
+    """WCAG 대비비 (1.0 ~ 21.0)."""
+    a, b = _relative_luminance(fg), _relative_luminance(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _hue_gap(a: str, b: str) -> float:
+    """두 색의 색상환 거리(0~180°). 파스텔은 밝기가 비슷해져 뜻 구분을 색상으로 본다."""
+    hues = []
+    for hexcode in (a, b):
+        raw = hexcode.lstrip("#")
+        r, g, bl = (int(raw[i : i + 2], 16) / 255 for i in (0, 2, 4))
+        hues.append(colorsys.rgb_to_hsv(r, g, bl)[0] * 360)
+    diff = abs(hues[0] - hues[1]) % 360
+    return min(diff, 360 - diff)
+
+
 class 사이트_색(unittest.TestCase):
-    """따뜻한 가족 팔레트다 — 회사 CI 오렌지가 남아 있으면 안 된다 (team-plan §1)."""
+    """밝은 하늘·민트 파스텔 팔레트다. 글자용 토큰은 대비 4.5:1 이상이어야 한다.
+
+    파스텔 원색(`--brand`·`--fun70` 등)은 면·막대·칩에만 쓴다 — 글자로 쓰면 대비가 2:1 대로 떨어진다.
+    """
+
+    def _blocks(self) -> tuple[dict[str, str], dict[str, str]]:
+        """(라이트 토큰, 다크 토큰). 다크는 라이트에 덮어써 빠진 토큰도 값을 갖는다."""
+        css = build_site.CSS
+        cut = css.index(DARK_AT)
+        light = dict(TOKEN_RX.findall(css[:cut]))
+        dark = dict(light)
+        dark.update(dict(TOKEN_RX.findall(css[cut : css.index("*,*::before", cut)])))
+        return light, dark
 
     def test_한화_오렌지가_없다(self):
         for hexcode in ("#F37321", "#F89B6C", "#FBB584", "#FF8F45", "#E8431B"):
             with self.subTest(hexcode=hexcode):
                 self.assertNotIn(hexcode.lower(), build_site.CSS.lower())
 
+    def test_이전_테라코타_팔레트가_없다(self):
+        """테라코타·세이지·크림은 하늘·민트로 갈았다 — 옛 hex 가 남아 있으면 팔레트가 섞인다."""
+        for hexcode in ("#C05B3E", "#9A4227", "#546E50", "#FAF6F1", "#E9DFD4", "#B03A2E", "#2A211C"):
+            with self.subTest(hexcode=hexcode):
+                self.assertNotIn(hexcode.lower(), build_site.CSS.lower())
+
     def test_라이트와_다크_토큰이_둘_다_있다(self):
-        self.assertIn("--brand-ink:#9A4227", build_site.CSS)
-        self.assertIn("@media (prefers-color-scheme:dark)", build_site.CSS)
+        self.assertIn("--brand-ink:#14607F", build_site.CSS)
+        self.assertIn(DARK_AT, build_site.CSS)
         self.assertEqual(build_site.CSS.count("--brand-ink:"), 2)
 
     def test_작은_글자용_토큰이_따로_있다(self):
         """본문·칩 글자에는 --brand 가 아니라 대비 4.5:1 이상인 --brand-ink 를 쓴다."""
         self.assertIn("color:var(--brand-ink)", build_site.CSS)
+
+    def test_글자_토큰이_면_대비_4점5_이상이다(self):
+        """라이트·다크 두 블록에서 글자/면 짝의 WCAG 대비를 숫자로 본다."""
+        light, dark = self._blocks()
+        for mode, tokens in (("라이트", light), ("다크", dark)):
+            for fg, bg in TEXT_ON_SURFACE:
+                with self.subTest(mode=mode, fg=fg, bg=bg):
+                    self.assertIn(fg, tokens)
+                    self.assertIn(bg, tokens)
+                    ratio = contrast_ratio(tokens[fg], tokens[bg])
+                    self.assertGreaterEqual(round(ratio, 2), 4.5, f"--{fg} on --{bg} = {ratio:.2f}:1")
+
+    def test_파스텔_원색에_흰_글자를_올리지_않는다(self):
+        """파스텔 면 위의 글자는 `--on-brand`·`--on-warn` 이다 — 흰 글자는 대비가 2:1 대로 떨어진다.
+
+        `color:#fff` 를 직접 적은 자리가 없어야 한다 (토큰 값의 `#FFFFFF` 는 본다).
+        """
+        self.assertIsNone(re.search(r"color:\s*#fff", build_site.CSS, re.IGNORECASE))
+        self.assertIn("color:var(--on-brand)", build_site.CSS)
+        self.assertIn("color:var(--on-warn)", build_site.CSS)
+
+    def test_완료와_경고가_다른_색이다(self):
+        """`--ok`(완료)와 `--warn`(경고)은 색상환에서 멀어야 한다 — 파스텔로 낮추면 밝기는 비슷해진다.
+
+        그래서 대비비가 아니라 **색상(hue) 거리**로 본다. 초록 계열 완료와 붉은 계열 경고가
+        같은 쪽으로 수렴하면 칩만 보고 뜻을 가릴 수 없다.
+        """
+        light, dark = self._blocks()
+        for mode, tokens in (("라이트", light), ("다크", dark)):
+            with self.subTest(mode=mode):
+                gap = _hue_gap(tokens["ok"], tokens["warn"])
+                self.assertGreaterEqual(gap, 60, f"--ok / --warn 색상 거리 {gap:.0f}°")
 
 
 class 정본과_같은_금지_패턴(unittest.TestCase):
@@ -1699,6 +1862,582 @@ class 빌드_산출물(unittest.TestCase):
             with self.subTest(where=where):
                 self.assertNotIn("김서연", blob)
                 self.assertNotIn("첫째", blob)
+
+
+class 일대기_검증(unittest.TestCase):
+    """docs/TIMELINE_SCHEMA.md '검증'. 파일이 하나라 어긋나면 일대기 섹션만 빠진다."""
+
+    def _errors(self, data):
+        return cards_data.validate_timeline(data)
+
+    def test_정상_일대기는_통과(self):
+        self.assertEqual(self._errors(make_timeline()), [])
+
+    def test_entries가_없어도_통과(self):
+        self.assertEqual(self._errors({"schema_version": 1, "group": GROUP}), [])
+
+    def test_schema_version이_다르면_거부(self):
+        t = make_timeline()
+        t["schema_version"] = 2
+        self.assertTrue(any("schema_version" in e for e in self._errors(t)))
+
+    def test_kind는_여덟_값이다(self):
+        self.assertEqual(
+            cards_data.TIMELINE_KINDS, ("가족", "여행", "집", "건강", "로하", "회사", "기념일", "기타")
+        )
+        for kind in cards_data.TIMELINE_KINDS:
+            with self.subTest(kind=kind):
+                t = make_timeline()
+                t["entries"][0]["kind"] = kind
+                self.assertEqual(self._errors(t), [])
+
+    def test_목록에_없는_kind는_거부(self):
+        t = make_timeline()
+        t["entries"][0]["kind"] = "회식"
+        self.assertTrue(any("entries[0].kind" in e for e in self._errors(t)))
+
+    def test_모든_kind에_사이트_색_클래스가_있다(self):
+        self.assertEqual(sorted(build_site.TIMELINE_KIND_CLASS), sorted(cards_data.TIMELINE_KINDS))
+
+    def test_title이_비면_거부(self):
+        t = make_timeline()
+        t["entries"][1]["title"] = "  "
+        self.assertTrue(any("entries[1].title" in e for e in self._errors(t)))
+
+    def test_date_형식과_달력을_본다(self):
+        for bad in ("2026/02/21", "2026-02-31", ""):
+            with self.subTest(date=bad):
+                t = make_timeline()
+                t["entries"][1]["date"] = bad
+                self.assertTrue(any("entries[1].date" in e for e in self._errors(t)))
+
+    def test_end가_date보다_빠르면_거부(self):
+        t = make_timeline()
+        t["entries"][0]["end"] = "2025-10-01"
+        self.assertTrue(any("entries[0].end" in e for e in self._errors(t)))
+
+    def test_비고가_비어_있지_않으면_거부(self):
+        """병원명·금액·괄호는 위키 비고 칸에 두고 카드에는 싣지 않는다 (일정 카드와 같은 규칙)."""
+        t = make_timeline()
+        t["entries"][0]["note"] = "숙소 32만원"
+        errs = self._errors(t)
+        self.assertTrue(any("entries[0].note" in e for e in errs))
+
+    def test_비고_거부_사유에_원문을_적지_않는다(self):
+        t = make_timeline()
+        t["entries"][0]["note"] = "32만원"
+        for e in self._errors(t):
+            self.assertNotIn("32만원", e)
+
+    def test_members가_배열이_아니면_거부(self):
+        t = make_timeline()
+        t["entries"][0]["members"] = "아빠"
+        self.assertTrue(any("entries[0].members" in e for e in self._errors(t)))
+
+    def test_링크는_거부(self):
+        t = make_timeline()
+        t["entries"][0]["title"] = "사진은 bit.ly/abc 에"
+        self.assertTrue(any("금지 패턴" in e for e in self._errors(t)))
+
+    def test_금지_키_거부(self):
+        t = make_timeline()
+        t["entries"][0]["quotes"] = ["원문"]
+        self.assertTrue(any("금지 키" in e for e in self._errors(t)))
+
+
+class 여행_검증(unittest.TestCase):
+    """docs/TRAVELS_SCHEMA.md '검증'. 좌표는 도시 수준 근사값이면 된다."""
+
+    def _errors(self, data):
+        return cards_data.validate_travels(data)
+
+    def test_정상_여행은_통과(self):
+        self.assertEqual(self._errors(make_travels()), [])
+
+    def test_trips가_없어도_통과(self):
+        self.assertEqual(self._errors({"schema_version": 1, "group": GROUP}), [])
+
+    def test_kind는_두_값이다(self):
+        self.assertEqual(cards_data.TRAVEL_KINDS, ("해외", "국내"))
+        t = make_travels()
+        t["trips"][0]["kind"] = "출장"
+        self.assertTrue(any("trips[0].kind" in e for e in self._errors(t)))
+
+    def test_id가_비면_거부(self):
+        t = make_travels()
+        t["trips"][0]["id"] = ""
+        self.assertTrue(any("trips[0].id" in e for e in self._errors(t)))
+
+    def test_id가_겹치면_거부(self):
+        t = make_travels()
+        t["trips"][1]["id"] = t["trips"][0]["id"]
+        self.assertTrue(any("trips[1].id" in e for e in self._errors(t)))
+
+    def test_id_사유에_값을_적지_않는다(self):
+        """id 에 지명이 들어 있다 — 사유는 공개 index 하단과 public 로그에 찍힌다."""
+        t = make_travels()
+        t["trips"][1]["id"] = t["trips"][0]["id"]
+        for e in self._errors(t):
+            self.assertNotIn("포르투갈", e)
+
+    def test_title이_비면_거부(self):
+        t = make_travels()
+        t["trips"][1]["title"] = ""
+        self.assertTrue(any("trips[1].title" in e for e in self._errors(t)))
+
+    def test_날짜_형식을_본다(self):
+        for key in ("start", "end"):
+            with self.subTest(key=key):
+                t = make_travels()
+                t["trips"][0][key] = "2025.10.07"
+                self.assertTrue(any(f"trips[0].{key}" in e for e in self._errors(t)))
+
+    def test_end가_start보다_빠르면_거부(self):
+        t = make_travels()
+        t["trips"][0]["end"] = "2025-10-01"
+        self.assertTrue(any("trips[0].end" in e for e in self._errors(t)))
+
+    def test_stops가_없으면_거부(self):
+        for empty in ([], None):
+            with self.subTest(stops=empty):
+                t = make_travels()
+                t["trips"][0]["stops"] = empty
+                self.assertTrue(any("trips[0].stops" in e for e in self._errors(t)))
+
+    def test_stop_이름이_비면_거부(self):
+        t = make_travels()
+        t["trips"][0]["stops"][1]["name"] = ""
+        self.assertTrue(any("trips[0].stops[1].name" in e for e in self._errors(t)))
+
+    def test_좌표_범위를_벗어나면_거부(self):
+        for key, value in (("lat", 91), ("lat", -90.1), ("lon", 181), ("lon", -200)):
+            with self.subTest(key=key, value=value):
+                t = make_travels()
+                t["trips"][0]["stops"][0][key] = value
+                self.assertTrue(any(f"trips[0].stops[0].{key}" in e for e in self._errors(t)))
+
+    def test_좌표가_숫자가_아니면_거부(self):
+        for value in ("38.72", None, True):
+            with self.subTest(value=value):
+                t = make_travels()
+                t["trips"][0]["stops"][0]["lat"] = value
+                self.assertTrue(any("trips[0].stops[0].lat" in e for e in self._errors(t)))
+
+    def test_하이라이트는_다섯_개까지(self):
+        t = make_travels()
+        t["trips"][0]["highlights"] = [f"줄 {i}" for i in range(6)]
+        self.assertTrue(any("trips[0].highlights" in e for e in self._errors(t)))
+
+    def test_하이라이트는_40자까지(self):
+        t = make_travels()
+        t["trips"][0]["highlights"] = ["가" * 41]
+        errs = self._errors(t)
+        self.assertTrue(any("trips[0].highlights[0]" in e for e in errs))
+        for e in errs:
+            self.assertNotIn("가" * 41, e)  # 사유에 원문을 적지 않는다
+
+    def test_하이라이트_링크는_거부(self):
+        t = make_travels()
+        t["trips"][0]["highlights"] = ["예약은 www.example.com"]
+        self.assertTrue(any("금지 패턴" in e for e in self._errors(t)))
+
+    def test_members가_배열이_아니면_거부(self):
+        t = make_travels()
+        t["trips"][0]["members"] = "아빠"
+        self.assertTrue(any("trips[0].members" in e for e in self._errors(t)))
+
+    def test_금지_키_거부(self):
+        t = make_travels()
+        t["trips"][0]["raw_quote"] = "원문"
+        self.assertTrue(any("금지 키" in e for e in self._errors(t)))
+
+
+class 일대기_정렬(unittest.TestCase):
+    def test_날짜_오름차순이고_같은_날은_파일_순서(self):
+        t = make_timeline()
+        t["entries"] = [
+            {"date": "2026-02-21", "kind": "집", "title": "나중"},
+            {"date": "2025-10-07", "kind": "여행", "title": "먼저"},
+            {"date": "2026-02-21", "kind": "가족", "title": "같은 날 둘째"},
+        ]
+        got = [e["title"] for e in cards_data.timeline_entries(t)]
+        self.assertEqual(got, ["먼저", "나중", "같은 날 둘째"])
+
+    def test_날짜가_없거나_달력에_없으면_빠진다(self):
+        t = make_timeline()
+        t["entries"] = [
+            {"date": "2026-02-31", "kind": "집", "title": "없는 날"},
+            {"date": "2026/02/21", "kind": "집", "title": "형식 틀림"},
+            {"date": "2026-02-21", "kind": "집", "title": "정상"},
+        ]
+        self.assertEqual([e["title"] for e in cards_data.timeline_entries(t)], ["정상"])
+
+    def test_파일이_없으면_빈_목록(self):
+        self.assertEqual(cards_data.timeline_entries(None), [])
+
+
+class 여행_정렬(unittest.TestCase):
+    def test_start_오름차순(self):
+        t = make_travels()
+        t["trips"].reverse()
+        self.assertEqual([x["id"] for x in cards_data.travel_trips(t)], ["2025-10-포르투갈", "2025-12-봉화-태백"])
+
+    def test_날짜가_읽히지_않으면_빠진다(self):
+        t = make_travels()
+        t["trips"][0]["start"] = "2025.10.07"
+        self.assertEqual(len(cards_data.travel_trips(t)), 1)
+
+    def test_좌표가_이상한_경유지는_핀에서_빠진다(self):
+        t = make_travels()
+        t["trips"][0]["stops"].append({"name": "이상", "lat": 999, "lon": 0})
+        t["trips"][0]["stops"].append({"name": "글자", "lat": "38", "lon": 0})
+        self.assertEqual([s["name"] for s in cards_data.trip_stops(t["trips"][0])], ["리스본", "포르투"])
+
+    def test_파일이_없으면_빈_목록(self):
+        self.assertEqual(cards_data.travel_trips(None), [])
+
+
+class 지도_데이터(unittest.TestCase):
+    """윤곽선은 생성물(`scripts/map_data.py`)이다 — 빌드는 네트워크를 쓰지 않는다."""
+
+    WORLD_MAX = 150 * 1024
+    KOREA_MAX = 40 * 1024
+
+    def test_크기_상한(self):
+        self.assertLessEqual(len(map_data.WORLD_PATH.encode("utf-8")), self.WORLD_MAX)
+        self.assertLessEqual(len(map_data.KOREA_PATH.encode("utf-8")), self.KOREA_MAX)
+
+    def test_경로는_SVG_문법이다(self):
+        for name, path in (("세계", map_data.WORLD_PATH), ("한국", map_data.KOREA_PATH)):
+            with self.subTest(map=name):
+                self.assertTrue(path.startswith("M"))
+                self.assertTrue(path.endswith("Z"))
+                self.assertIsNone(re.search(r"[^MLZ0-9.\- ]", path))
+
+    def test_viewBox는_숫자_넷이다(self):
+        for name, vb in (("세계", map_data.WORLD_VIEWBOX), ("한국", map_data.KOREA_VIEWBOX)):
+            with self.subTest(map=name):
+                parts = vb.split()
+                self.assertEqual(len(parts), 4)
+                for p in parts:
+                    float(p)
+
+    def test_세계는_등장방형_전체다(self):
+        self.assertEqual(map_data.WORLD_VIEWBOX, "-180 -90 360 180")
+
+    def test_투영은_경위도를_그대로_쓴다(self):
+        self.assertEqual(map_data.project_world(38.72, -9.14), (-9.14, -38.72))
+        self.assertEqual(map_data.project_korea(36.89, 128.73), (128.73, -36.89))
+
+    def test_한국_viewBox_안에_국내_좌표가_든다(self):
+        x0, y0, w, h = (float(v) for v in map_data.KOREA_VIEWBOX.split())
+        for lat, lon in ((37.57, 126.98), (33.45, 126.55), (35.18, 129.08)):  # 서울·제주·부산
+            with self.subTest(lat=lat, lon=lon):
+                x, y = map_data.project_korea(lat, lon)
+                self.assertTrue(x0 <= x <= x0 + w and y0 <= y <= y0 + h)
+
+    def test_생성물에_링크를_두지_않는다(self):
+        """카드 검증기가 링크를 막는다 — 주소는 make_map_data.py 에만 둔다."""
+        src = (SCRIPTS_DIR / "map_data.py").read_text(encoding="utf-8")
+        self.assertNotIn("http", src)
+        self.assertIn("public domain", src)
+
+
+CIRCLE_RX = re.compile(r'<circle cx="(-?[\d.]+)" cy="(-?[\d.]+)" r="(-?[\d.]+)"/>')
+SVG_RX = re.compile(r'<svg viewBox="([^"]+)"[^>]*>(.*?)</svg>', re.S)
+
+
+def svg_maps(html: str) -> list[tuple[tuple[float, ...], list[tuple[float, float, float]]]]:
+    """HTML 에서 (viewBox, [(cx, cy, r)]) 를 뽑는다."""
+    out = []
+    for m in SVG_RX.finditer(html):
+        vb = tuple(float(v) for v in m.group(1).split())
+        out.append((vb, [(float(a), float(b), float(c)) for a, b, c in CIRCLE_RX.findall(m.group(2))]))
+    return out
+
+
+class 일대기_카드(unittest.TestCase):
+    """목록에는 최근 12건과 '전체 보기', 전체는 t/timeline.html (정본 §1)."""
+
+    def _index(self, **kw):
+        args = {
+            "profiles": [], "projects": [], "skipped": [], "group": GROUP,
+            "built": "2026-09-22 10:00 KST", "generated": "", "today": TUE,
+            "timeline": make_timeline(),
+        }
+        args.update(kw)
+        return build_site.render_index(**args)
+
+    def test_섹션_순서는_일정_다음이고_계획_앞이다(self):
+        h = self._index()
+        order = [
+            h.index(f"sec {cls}")
+            for cls in ("sec-daily", "sec-sched", "sec-timeline", "sec-travel", "sec-proj", "sec-members", "sec-changes")
+        ]
+        self.assertEqual(order, sorted(order))
+
+    def test_연도와_월_구분이_있다(self):
+        h = self._index()
+        self.assertIn('<div class="tlyhead">2026년<i>1건</i></div>', h)
+        self.assertIn('<div class="tlmhead">2월</div>', h)
+        self.assertIn('<div class="tlmhead">10월</div>', h)
+
+    def test_최신이_위다(self):
+        h = self._index()
+        self.assertLess(h.index("2026년"), h.index("2025년"))
+
+    def test_날짜_구분_제목_누구를_그린다(self):
+        h = self._index()
+        self.assertIn('<span class="tldate">2/21</span>', h)
+        self.assertIn('<span class="tk tk-home">집</span>', h)
+        self.assertIn('<span class="tltitle">새 집으로 이사</span>', h)
+        self.assertIn('<span class="tlmem">아빠</span>', h)
+
+    def test_기간_항목은_물결로_적는다(self):
+        self.assertIn('<span class="tldate">10/7 ~ 10/20</span>', self._index())
+
+    def test_구분_여덟_종류에_다_색이_붙는다(self):
+        for kind in cards_data.TIMELINE_KINDS:
+            with self.subTest(kind=kind):
+                t = make_timeline()
+                t["entries"][1]["kind"] = kind
+                h = self._index(timeline=t)
+                self.assertIn(f'<span class="tk {build_site.TIMELINE_KIND_CLASS[kind]}">{kind}</span>', h)
+
+    def test_목록은_열두_건까지고_전체_보기가_붙는다(self):
+        t = make_timeline()
+        t["entries"] = [
+            {"date": f"2026-{m:02d}-01", "kind": "가족", "title": f"사건 {m}", "members": [], "note": ""}
+            for m in range(1, 13)
+        ] + [{"date": "2025-01-01", "kind": "가족", "title": "가장 오래된 것", "members": [], "note": ""}]
+        h = self._index(timeline=t)
+        part = h[h.index("sec sec-timeline"):h.index("sec sec-travel")]
+        self.assertEqual(part.count('<span class="tltitle">'), cards_data.SITE_TIMELINE_ITEMS)
+        self.assertIn("사건 12", part)   # 최신
+        self.assertIn("사건 1</span>", part)
+        self.assertNotIn("가장 오래된 것", part)
+        self.assertIn('href="t/timeline.html"', part)
+        self.assertIn("전체 보기", part)
+
+    def test_열두_건_이하면_전체_보기를_붙이지_않는다(self):
+        part = self._index()
+        self.assertNotIn('href="t/timeline.html"', part)
+
+    def test_데이터가_없으면_빈_문구(self):
+        h = self._index(timeline=None)
+        self.assertIn("아직 적어 둔 일대기가 없다", h)
+        self.assertIn("<b>일대기</b>0건", h)
+        self.assertIn("sec-timeline", h)
+
+    def test_비고는_그리지_않는다(self):
+        """검증기를 우회해 note 가 들어와도 카드에 나오지 않아야 한다."""
+        t = make_timeline()
+        t["entries"][0]["note"] = "이사비 320만원"
+        h = self._index(timeline=t)
+        self.assertNotIn("320만원", h)
+
+    def test_상세_페이지는_전체를_그린다(self):
+        entries = list(reversed(cards_data.timeline_entries(make_timeline())))
+        h = build_site.render_timeline_page(entries, GROUP, "2026-09-22 10:00 KST", {})
+        self.assertIn(f"<title>가족 일대기 · {GROUP}</title>", h)
+        self.assertIn("새 집으로 이사", h)
+        self.assertIn("포르투갈 13박 여행", h)
+        self.assertIn('href="../index.html#timeline"', h)
+        self.assertNotIn("<script", h)
+        self.assertNotIn("http://", h)
+        self.assertNotIn("https://", h)
+
+
+class 여행_지도_카드(unittest.TestCase):
+    """인라인 SVG 지도 + 여행 목록 (정본 §2). 외부 타일·JS·CDN 없다."""
+
+    def _index(self, **kw):
+        args = {
+            "profiles": [], "projects": [], "skipped": [], "group": GROUP,
+            "built": "2026-09-22 10:00 KST", "generated": "", "today": TUE,
+            "travels": make_travels(),
+        }
+        args.update(kw)
+        return build_site.render_index(**args)
+
+    def test_지도_두_장과_핀_넷이_그려진다(self):
+        maps = svg_maps(self._index())
+        self.assertEqual(len(maps), 2)  # 세계 + 한국 인셋
+        self.assertEqual([len(circles) for _, circles in maps], [2, 2])
+
+    def test_핀은_viewBox_안에_있다(self):
+        for vb, circles in svg_maps(self._index()):
+            x0, y0, w, h = vb
+            for cx, cy, r in circles:
+                with self.subTest(vb=vb, cx=cx, cy=cy):
+                    self.assertTrue(x0 <= cx <= x0 + w, f"{cx} ∉ [{x0}, {x0 + w}]")
+                    self.assertTrue(y0 <= cy <= y0 + h, f"{cy} ∉ [{y0}, {y0 + h}]")
+                    self.assertGreater(r, 0)
+
+    def test_핀_자리는_경위도_그대로다(self):
+        """이웃 도시는 밀지 않는다 — 세계 지도에서 핀 반지름이 수백 km 를 덮기 때문이다."""
+        world = svg_maps(self._index())[0][1]
+        self.assertEqual(
+            sorted((cx, cy) for cx, cy, _ in world), sorted([(-9.14, -38.72), (-8.61, -41.15)])
+        )
+
+    def test_같은_자리의_핀은_살짝_벌린다(self):
+        """같은 도시를 두 번 갔을 때 핀 하나만 보이지 않게 — 벌리는 거리는 반지름의 1.3배까지다."""
+        t = make_travels()
+        t["trips"][0]["stops"] = [
+            {"name": "리스본", "lat": 38.72, "lon": -9.14},
+            {"name": "리스본 다시", "lat": 38.72, "lon": -9.14},
+        ]
+        world = svg_maps(self._index(travels=t))[0][1]
+        self.assertEqual(len(world), 2)
+        (ax, ay, r), (bx, by, _) = world
+        self.assertNotEqual((ax, ay), (bx, by))
+        moved = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+        self.assertGreater(moved, r * 0.5)
+        self.assertLessEqual(moved, r * 1.4)
+
+    def test_핀_색은_국내_하늘_해외_민트다(self):
+        h = self._index()
+        self.assertIn('<g class="pin abr">', h)
+        self.assertIn('<g class="pin dom">', h)
+        self.assertIn(".pin.dom circle{fill:var(--brand)}", h)
+        self.assertIn(".pin.abr circle{fill:var(--fun70)}", h)
+
+    def test_핀에_툴팁이_붙는다(self):
+        h = self._index()
+        self.assertIn("<title>1 · 리스본 · 포르투갈 · 2025.10.7~20 · 13박</title>", h)
+        self.assertIn("<title>2 · 봉화 · 봉화·태백 · 2025.12.25~27 · 2박</title>", h)
+
+    def test_같은_여행의_경유지는_점선으로_잇는다(self):
+        h = self._index()
+        self.assertEqual(h.count('<path class="hop"'), 2)  # 여행마다 한 줄
+        self.assertIn("stroke-dasharray", h)
+
+    def test_핀_번호는_여행_순서다(self):
+        h = self._index()
+        world = h[h.index('mapbox map-world'):h.index('mapbox map-korea')]
+        self.assertIn(">1</text>", world)
+        self.assertNotIn(">2</text>", world)
+
+    def test_배지에_해외와_국내_건수가_있다(self):
+        h = self._index()
+        self.assertIn('<span class="tvbadge">해외 1</span>', h)
+        self.assertIn('<span class="tvbadge dom">국내 1</span>', h)
+
+    def test_목록에_기간_여행지_누구_하이라이트가_있다(self):
+        h = self._index()
+        self.assertIn('<span class="tvname">포르투갈</span>', h)
+        self.assertIn("2025.10.7~20 · 13박", h)
+        self.assertIn("리스본 → 포르투", h)
+        self.assertIn('<span class="tvchip">아빠</span>', h)
+        self.assertIn('<span class="tvchip hl">트램 타고 알파마 언덕</span>', h)
+
+    def test_데이터가_없으면_지도도_없다(self):
+        h = self._index(travels=None)
+        self.assertIn("아직 기록한 여행이 없다", h)
+        self.assertNotIn("<svg", h)
+        self.assertIn("<b>여행</b>0건", h)
+        self.assertIn("sec-travel", h)
+
+    def test_국내만_있으면_세계_지도는_그리지_않는다(self):
+        t = make_travels()
+        t["trips"] = [t["trips"][1]]
+        maps = svg_maps(self._index(travels=t))
+        self.assertEqual(len(maps), 1)
+        self.assertEqual(maps[0][0], tuple(float(v) for v in map_data.KOREA_VIEWBOX.split()))
+
+    def test_지도에_외부_주소가_없다(self):
+        h = self._index()
+        self.assertNotIn("<script", h)
+        self.assertNotIn("http://", h)
+        self.assertNotIn("https://", h)
+        self.assertNotIn("xlink", h)
+
+    def test_상세_페이지는_여행별_카드다(self):
+        trips = cards_data.travel_trips(make_travels())
+        h = build_site.render_travels_page(trips, GROUP, "2026-09-22 10:00 KST", {})
+        self.assertIn(f"<title>우리가 다녀온 곳 · {GROUP}</title>", h)
+        self.assertEqual(h.count('class="card tvcard'), 2)  # 여행 두 건
+        self.assertIn('href="../index.html#travels"', h)
+        self.assertEqual(len(svg_maps(h)), 2)
+        self.assertNotIn("<script", h)
+        self.assertNotIn("https://", h)
+
+    def test_지도_면과_선_토큰이_라이트_다크에_다_있다(self):
+        css = build_site.CSS
+        for token in ("--map-sea", "--map-land", "--map-line"):
+            with self.subTest(token=token):
+                self.assertEqual(css.count(f"{token}:"), 2)
+
+
+class 일대기와_여행_적재(unittest.TestCase):
+    """`data/timeline.json`·`data/travels.json` 도 파일 하나가 카드 한 장이다."""
+
+    def _root(self, files: dict[str, str]) -> pathlib.Path:
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "data" / "profiles").mkdir(parents=True)
+        (root / "data" / "projects").mkdir(parents=True)
+        for name, body in files.items():
+            (root / "data" / name).write_text(body, encoding="utf-8")
+        return root
+
+    def test_CARD_FILES에_들어_있다(self):
+        names = dict(cards_data.CARD_FILES)
+        self.assertEqual(names["timeline"], "timeline.json")
+        self.assertEqual(names["travel"], "travels.json")
+
+    def test_두_파일을_카드로_읽는다(self):
+        root = self._root({
+            "timeline.json": json.dumps(make_timeline(), ensure_ascii=False),
+            "travels.json": json.dumps(make_travels(), ensure_ascii=False),
+        })
+        cards = {c.kind: c for c in cards_data.load_local(root)}
+        self.assertEqual(cards["timeline"].file, "timeline.json")
+        self.assertEqual(cards["travel"].file, "travels.json")
+        self.assertTrue(cards["timeline"].ok)
+        self.assertTrue(cards["travel"].ok)
+
+    def test_없어도_빌드는_된다(self):
+        cards = cards_data.load_local(self._root({}))
+        self.assertEqual([c for c in cards if c.kind in ("timeline", "travel")], [])
+
+    def test_어긋나면_그_파일만_건너뛴다(self):
+        bad = make_travels()
+        bad["trips"][0]["kind"] = "출장"
+        root = self._root({
+            "timeline.json": json.dumps(make_timeline(), ensure_ascii=False),
+            "travels.json": json.dumps(bad, ensure_ascii=False),
+        })
+        cards = {c.kind: c for c in cards_data.load_local(root)}
+        self.assertTrue(cards["timeline"].ok)
+        self.assertFalse(cards["travel"].ok)
+
+    def test_건너뛴_종류_이름이_있다(self):
+        self.assertEqual(build_site.CARD_KIND_KO["timeline"], "일대기 카드")
+        self.assertEqual(build_site.CARD_KIND_KO["travel"], "여행 카드")
+
+    def test_빌드가_상세_페이지_두_장을_만든다(self):
+        out = pathlib.Path(tempfile.mkdtemp()) / "_site"
+        self.addCleanup(shutil.rmtree, out.parent, True)
+        cards = [
+            cards_data.Card("timeline", "timeline.json", make_timeline()),
+            cards_data.Card("travel", "travels.json", make_travels()),
+        ]
+        build_site.build(cards, out)
+        self.assertTrue((out / "t" / "timeline.html").is_file())
+        self.assertTrue((out / "t" / "travels.html").is_file())
+        index = (out / "index.html").read_text(encoding="utf-8")
+        self.assertIn("새 집으로 이사", index)
+        self.assertIn('<span class="tvname">포르투갈</span>', index)
+
+    def test_카드가_0건이어도_상세_페이지는_생긴다(self):
+        """목록의 '전체 보기' 링크가 깨지지 않게 빈 페이지라도 만든다."""
+        out = pathlib.Path(tempfile.mkdtemp()) / "_site"
+        self.addCleanup(shutil.rmtree, out.parent, True)
+        build_site.build([], out)
+        self.assertIn("아직 적어 둔 일대기가 없다", (out / "t" / "timeline.html").read_text(encoding="utf-8"))
+        self.assertIn("아직 기록한 여행이 없다", (out / "t" / "travels.html").read_text(encoding="utf-8"))
 
 
 class 달력에_없는_날짜(unittest.TestCase):
