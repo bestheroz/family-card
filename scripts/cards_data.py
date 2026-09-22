@@ -105,6 +105,14 @@ class GitHub:
                     continue
                 # 한 줄로 접는다 — ::error:: 주석은 첫 줄만 보여 준다.
                 body = " ".join(e.read().decode("utf-8", errors="replace").split())[:300]
+                if e.code == 401:
+                    # "Bad credentials" 는 권한 부족(403·404)이 아니라 토큰 문자열 자체를 못 알아본 것이다.
+                    # 시크릿에 토큰만 들어갔는지(접두어·공백·따옴표 없이), 폐기·만료되지 않았는지 본다 (2026-09-22).
+                    raise ApiError(
+                        f"HTTP 401 {path}: 토큰이 유효하지 않다 (Bad credentials). WIKI_READ_TOKEN 시크릿 값이 "
+                        f"토큰 문자열 그대로인지, 폐기·만료되지 않았는지 확인한다. 로컬 확인: "
+                        f"curl -sS -H 'Authorization: Bearer $TOKEN' https://api.github.com/user"
+                    ) from e
                 raise ApiError(f"HTTP {e.code} {path}: {body}") from e
             except (urllib.error.URLError, TimeoutError) as e:
                 if attempt < 3:
