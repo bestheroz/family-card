@@ -1,0 +1,98 @@
+name: Deploy cards site (GitHub Pages)
+
+# family-wiki(private) 의 data/ 카드 JSON 만 읽어 정적 사이트(_site/)를 만들고 GitHub Pages 로 배포한다.
+# ⚠️ 이 저장소는 public 이고 사이트는 인터넷에 공개된다. 카드 JSON 화이트리스트만 빌드하고
+#    위키 본문·카톡 원문은 절대 넣지 않는다 (family-wiki/docs/PRIVACY.md).
+# 최초 1회: Settings → Pages → Build and deployment → Source = "GitHub Actions"
+#           Settings → Secrets → Actions 에 WIKI_READ_TOKEN (family-wiki Contents: Read)
+#           family-wiki 쪽 Secret 에 CARDS_DISPATCH_TOKEN (이 저장소 Contents: Read and write)
+#           (선택) CARDS_FORBIDDEN_NAMES — 카드에 실리면 안 되는 이름, 쉼표 구분
+
+on:
+  # 주 트리거. family-wiki 의 data/ 가 바뀔 때만 그쪽 notify-cards.yml 이 보낸다.
+  # 위키에 데이터가 늘 들어오지는 않는다 — 시간 단위로 긁지 말고 바뀐 순간에만 다시 그린다.
+  repository_dispatch:
+    types: [wiki-data-updated]
+  schedule:
+    # 안전망 하나만 남긴다. 신호가 끊겨도(family-wiki 의 PAT 만료·삭제) 하루 안에는 반영된다.
+    # 분 값은 정시(:00)를 피한다. GitHub 은 매시 정각에 부하가 몰리면 스케줄 실행을 지연시키거나
+    # 아예 버린다고 문서에 명시한다 ("some queued jobs may be dropped").
+    - cron: "37 0 * * *"       # 매일 09:37 KST. 스케줄은 수십 분 지연될 수 있다
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - scripts/**
+      - .github/workflows/pages.yml
+
+# 전역은 최소 권한만. `pages`·`id-token`·`issues` 는 그것이 필요한 잡에서만 켠다 (최소 권한).
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 이슈를 만들지 않는 잡이다 — `issues: write` 를 주지 않는다 (실패 알림은 notify 잡이 한다)
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/setup-python@main
+        with:
+          python-version: "3.14"
+      - name: Run tests
+        run: python -m unittest discover -s scripts -p 'test_*.py'
+      - name: Build site from family-wiki data
+        env:
+          GH_TOKEN: ${{ secrets.WIKI_READ_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+          WIKI_REPO: family-wiki
+          WIKI_REF: main
+          CARDS_FORBIDDEN_NAMES: ${{ secrets.CARDS_FORBIDDEN_NAMES }}
+        run: python scripts/build_site.py --out _site
+      - uses: actions/configure-pages@main
+      - uses: actions/upload-pages-artifact@main
+        with:
+          path: _site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@main
+
+  # 실패를 이슈로 알리는 잡. `issues: write` 를 가진 잡은 여기 하나뿐이고 데이터도 시크릿도 만지지 않는다.
+  notify-failure:
+    needs: [build, deploy]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="카드 사이트 배포 실패"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number')
+          BODY="워크플로 실행이 실패했습니다: $RUN_URL
+
+          흔한 원인: \`WIKI_READ_TOKEN\` 미등록·만료 또는 family-wiki 읽기 권한 없음. 테스트 단계가 빨간불이면 \`scripts/\` 변경을 먼저 본다. Pages Source 가 GitHub Actions 가 아니면 deploy 단계가 실패한다."
+          if [ -n "$EXISTING" ]; then gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          else gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"; fi
